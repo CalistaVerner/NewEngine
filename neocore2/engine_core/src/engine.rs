@@ -10,17 +10,22 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-use crate::{log::Logger, module::Module, phase::FramePhase, time::Time};
+use crate::{
+    frame::{FrameConstitution, FrameContext},
+    log::Logger,
+    phase::FramePhase,
+    schedule::FrameSchedule,
+    signals::ExitSignal,
+    telemetry::Telemetry,
+    time::Time,
+};
 
 pub struct EngineConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
 
-    pub fixed_dt_sec: f32,
-
-    pub log_fps: bool,
-    pub fps_log_period_sec: f32,
+    pub frame: FrameConstitution,
 }
 
 impl Default for EngineConfig {
@@ -29,24 +34,15 @@ impl Default for EngineConfig {
             title: "NEOCORE2".to_string(),
             width: 1280,
             height: 720,
-            fixed_dt_sec: 1.0 / 60.0,
-            log_fps: true,
-            fps_log_period_sec: 1.0,
+            frame: FrameConstitution::default(),
         }
     }
-}
-
-pub struct EngineContext<'a> {
-    pub log: &'a Logger,
-    pub window: &'a Window,
-    pub time: &'a Time,
-    pub exit_requested: &'a mut bool,
 }
 
 pub struct Engine {
     cfg: EngineConfig,
     log: Logger,
-    modules: Vec<Box<dyn Module>>,
+    schedule: FrameSchedule,
 }
 
 impl Engine {
@@ -54,20 +50,18 @@ impl Engine {
         Self {
             cfg,
             log: Logger::new("Engine"),
-            modules: Vec::new(),
+            schedule: FrameSchedule::new(),
         }
     }
 
-    pub fn add_module<M: Module + 'static>(&mut self, m: M) {
-        self.modules.push(Box::new(m));
+    pub fn add_module<M: crate::module::Module + 'static>(&mut self, m: M) {
+        self.schedule.add_module(m);
     }
 
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new()?;
-
         let mut app = EngineApp::new(self);
         event_loop.run_app(&mut app)?;
-
         Ok(())
     }
 }
@@ -82,19 +76,33 @@ struct EngineApp {
     shutdown_done: bool,
     started: bool,
 
+    constitution: FrameConstitution,
     time: Time,
+    telemetry: Telemetry,
+
     last: Instant,
     accumulator: f32,
 
-    fps_last: Instant,
-    fps_frames: u32,
+    exit_signal: ExitSignal,
+
+    // debug counters for logs like "fixed tick 60"
+    last_fixed_tick_logged: u64,
 }
 
 impl EngineApp {
     fn new(engine: Engine) -> Self {
-        let fixed_dt = engine.cfg.fixed_dt_sec;
+        let constitution = engine.cfg.frame.clone();
+        let fixed_dt = constitution.fixed_dt_sec;
+
+        let exit_signal = ExitSignal::new();
+        let _ = exit_signal.install_ctrlc_handler();
+
+        let mut telemetry = Telemetry::new();
+        telemetry.configure_fps_logging(constitution.log_fps, constitution.fps_log_period_sec);
+
         Self {
             engine,
+
             window: None,
             window_id: None,
 
@@ -102,16 +110,20 @@ impl EngineApp {
             shutdown_done: false,
             started: false,
 
+            constitution,
             time: Time::new(fixed_dt),
+            telemetry,
+
             last: Instant::now(),
             accumulator: 0.0,
 
-            fps_last: Instant::now(),
-            fps_frames: 0,
+            exit_signal,
+
+            last_fixed_tick_logged: 0,
         }
     }
 
-    fn start_modules(&mut self) {
+    fn start_if_needed(&mut self) {
         if self.started {
             return;
         }
@@ -119,63 +131,38 @@ impl EngineApp {
 
         self.engine.log.info("boot");
 
-        {
-            let mut ctx = EngineContext {
-                log: &self.engine.log,
-                window,
-                time: &self.time,
-                exit_requested: &mut self.exit_requested,
-            };
-            for m in self.engine.modules.iter_mut() {
-                m.on_register(&mut ctx);
-            }
-            for m in self.engine.modules.iter_mut() {
-                m.on_start(&mut ctx);
-            }
-        }
-
-        self.started = true;
-        self.last = Instant::now();
-        self.fps_last = Instant::now();
-        self.fps_frames = 0;
-        self.accumulator = 0.0;
-    }
-
-    fn phase(&mut self, phase: FramePhase) {
-        let Some(window) = self.window.as_ref() else { return; };
-
-        let mut ctx = EngineContext {
-            log: &self.engine.log,
+        // ctx живёт только на период вызова register/start
+        let mut ctx = FrameContext {
             window,
-            time: &self.time,
+            time: &mut self.time,
+            telemetry: &mut self.telemetry,
             exit_requested: &mut self.exit_requested,
         };
 
-        for m in self.engine.modules.iter_mut() {
-            m.on_phase(phase, &mut ctx);
-        }
+        self.engine.schedule.on_register(&mut ctx);
+        self.engine.schedule.on_start(&mut ctx);
+
+        self.started = true;
+        self.last = Instant::now();
+        self.accumulator = 0.0;
+
+        self.engine.log.info("first frame");
     }
 
-    fn maybe_shutdown(&mut self, el: &ActiveEventLoop) {
+    fn shutdown_once(&mut self, el: &ActiveEventLoop) {
         if self.shutdown_done {
             return;
         }
-        if !self.exit_requested {
-            return;
-        }
-
         self.shutdown_done = true;
 
         if let Some(window) = self.window.as_ref() {
-            let mut ctx = EngineContext {
-                log: &self.engine.log,
+            let mut ctx = FrameContext {
                 window,
-                time: &self.time,
+                time: &mut self.time,
+                telemetry: &mut self.telemetry,
                 exit_requested: &mut self.exit_requested,
             };
-            for m in self.engine.modules.iter_mut().rev() {
-                m.on_shutdown(&mut ctx);
-            }
+            self.engine.schedule.on_shutdown(&mut ctx);
         }
 
         self.engine.log.info("shutdown");
@@ -196,7 +183,6 @@ impl ApplicationHandler for EngineApp {
         let window = match el.create_window(attrs) {
             Ok(w) => w,
             Err(e) => {
-                // Нечего “красиво” делать — лучше честно выйти.
                 eprintln!("failed to create window: {e}");
                 el.exit();
                 return;
@@ -206,7 +192,7 @@ impl ApplicationHandler for EngineApp {
         self.window_id = Some(window.id());
         self.window = Some(window);
 
-        self.start_modules();
+        self.start_if_needed();
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -236,68 +222,90 @@ impl ApplicationHandler for EngineApp {
             return;
         }
 
-        // Если уже попросили выйти — закрываемся один раз, без дублей.
+        // Ctrl+C → мягкий выход через нашу конституцию shutdown.
+        if self.exit_signal.is_exit_requested() {
+            self.exit_requested = true;
+        }
+
         if self.exit_requested {
-            self.maybe_shutdown(el);
+            self.shutdown_once(el);
             return;
         }
 
         let now = Instant::now();
-        let dt = now.duration_since(self.last);
+        let raw_dt = now.duration_since(self.last);
         self.last = now;
 
-        let dt_sec = dt.as_secs_f32().min(0.25);
+        // clamp dt
+        let dt_sec = raw_dt.as_secs_f32().min(self.constitution.max_dt_sec);
+
+        // Эти поля можно обновлять до ctx (пока time не заняли borrow'ом)
         self.time.dt_sec = dt_sec;
-        self.time.t_sec += dt.as_secs_f64();
+        self.time.t_sec += raw_dt.as_secs_f64();
         self.time.frame_index += 1;
 
         self.accumulator += dt_sec;
 
-        self.phase(FramePhase::BeginFrame);
-        self.phase(FramePhase::Input);
+        let Some(window) = self.window.as_ref() else { return; };
 
-        while self.accumulator >= self.engine.cfg.fixed_dt_sec {
-            self.time.fixed_tick_index += 1;
-            self.phase(FramePhase::FixedUpdate);
-            self.accumulator -= self.engine.cfg.fixed_dt_sec;
-        }
+        // Теперь создаём ctx и дальше трогаем time/telemetry/exit только через ctx
+        let mut ctx = FrameContext {
+            window,
+            time: &mut self.time,
+            telemetry: &mut self.telemetry,
+            exit_requested: &mut self.exit_requested,
+        };
 
-        self.time.fixed_alpha = (self.accumulator / self.engine.cfg.fixed_dt_sec).clamp(0.0, 1.0);
+        self.engine.schedule.run_phase(FramePhase::BeginFrame, &mut ctx);
+        self.engine.schedule.run_phase(FramePhase::Input, &mut ctx);
 
-        self.phase(FramePhase::Update);
-        self.phase(FramePhase::LateUpdate);
-        self.phase(FramePhase::Render);
-        self.phase(FramePhase::Present);
-        self.phase(FramePhase::EndFrame);
+        // FixedUpdate with cap (anti spiral-of-death)
+        let mut steps: u32 = 0;
+        while self.accumulator >= self.constitution.fixed_dt_sec {
+            if steps >= self.constitution.max_fixed_steps_per_frame {
+                // не пытаемся “догонять” бесконечно
+                self.accumulator = 0.0;
+                break;
+            }
 
-        if self.engine.cfg.log_fps {
-            self.fps_frames += 1;
-            let period = self.engine.cfg.fps_log_period_sec.max(0.25);
-            if self.fps_last.elapsed().as_secs_f32() >= period {
-                let secs = self.fps_last.elapsed().as_secs_f32().max(0.0001);
-                let fps = (self.fps_frames as f32) / secs;
+            ctx.time.fixed_tick_index += 1;
+            self.engine.schedule.run_phase(FramePhase::FixedUpdate, &mut ctx);
 
-                self.engine.log.info(format!(
-                    "fps={:.1} dt_ms={:.2} fixed_alpha={:.2} fixed_tick={}",
-                    fps,
-                    self.time.dt_sec * 1000.0,
-                    self.time.fixed_alpha,
-                    self.time.fixed_tick_index
-                ));
+            self.accumulator -= self.constitution.fixed_dt_sec;
+            steps += 1;
 
-                self.fps_frames = 0;
-                self.fps_last = Instant::now();
+            // debug tick log каждые 60
+            let tick = ctx.time.fixed_tick_index;
+            if tick / 60 != self.last_fixed_tick_logged / 60 && (tick % 60 == 0) {
+                self.last_fixed_tick_logged = tick;
+                self.engine.log.debug(format!("fixed tick {}", tick));
             }
         }
 
-        // На всякий случай — если какой-то модуль поставил exit_requested в фазах.
-        if self.exit_requested {
-            self.maybe_shutdown(el);
+        ctx.time.fixed_alpha =
+            (self.accumulator / self.constitution.fixed_dt_sec).clamp(0.0, 1.0);
+
+        self.engine.schedule.run_phase(FramePhase::Update, &mut ctx);
+        self.engine.schedule.run_phase(FramePhase::LateUpdate, &mut ctx);
+        self.engine.schedule.run_phase(FramePhase::Render, &mut ctx);
+        self.engine.schedule.run_phase(FramePhase::Present, &mut ctx);
+        self.engine.schedule.run_phase(FramePhase::EndFrame, &mut ctx);
+
+        // Telemetry tick (fps log и т.п.) — тоже через ctx.telemetry
+        ctx.telemetry
+            .frame_tick(raw_dt, ctx.time.fixed_alpha, ctx.time.fixed_tick_index);
+
+        // Сохраняем флаг выхода, пока ctx ещё жив (он владеет &mut exit_requested)
+        let exit_now = *ctx.exit_requested;
+
+        // Освобождаем borrows time/telemetry/exit_requested
+        drop(ctx);
+
+        if exit_now {
+            self.shutdown_once(el);
             return;
         }
 
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
-        }
+        window.request_redraw();
     }
 }
