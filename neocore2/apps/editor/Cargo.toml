@@ -1,0 +1,13 @@
+[package]
+name = "editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+log = "0.4"
+
+newengine-core = { path = "../../crates/newengine-core" }
+newengine-platform-winit = { path = "../../crates/newengine-platform-winit" }
+newengine-modules-cef = { path = "../../crates/newengine-modules-cef" }
+newengine-modules-window-winit = { path = "../../crates/newengine-modules-window-winit" }

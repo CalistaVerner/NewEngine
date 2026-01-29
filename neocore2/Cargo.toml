@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "engine_core",
-    "app"
+  "crates/newengine-core",
+  "crates/newengine-platform-winit",
+  "crates/newengine-modules-window-winit",
+  "crates/newengine-modules-cef",
+  "apps/editor",
 ]
+
+[workspace.package]
+edition = "2021"
+license = "Proprietary"
