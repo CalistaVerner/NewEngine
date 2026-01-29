@@ -1,2 +1,3 @@
-mod shutdown;
-pub use shutdown::ShutdownToken;
+mod sync;
+
+pub use sync::ShutdownToken;

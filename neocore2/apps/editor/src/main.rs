@@ -1,6 +1,6 @@
 use crossbeam_channel::unbounded;
 
-use newengine_core::{Bus, Engine, EngineResult, Services};
+use newengine_core::{Bus, Engine, EngineResult, Services, ShutdownToken};
 use newengine_platform_winit::run_winit_app;
 
 struct AppServices;
@@ -25,10 +25,14 @@ enum EditorEvent {
 
 fn main() -> EngineResult<()> {
     let (tx, rx) = unbounded::<EditorEvent>();
-    let bus = Bus::new(tx, rx);
+    let bus: Bus<EditorEvent> = Bus::new(tx, rx);
 
     let services: Box<dyn Services> = Box::new(AppServices::new());
-    let mut engine = Engine::new(16, services, bus)?;
+
+    // ВАЖНО: четвертый параметр
+    let shutdown = ShutdownToken::new(); // или ShutdownToken::default()
+
+    let mut engine: Engine<EditorEvent> = Engine::new(16, services, bus, shutdown)?;
 
     engine.register_module(Box::new(newengine_modules_cef::CefModule::new()))?;
 

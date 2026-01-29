@@ -9,6 +9,8 @@ use super::ModuleCtx;
 /// - Resources (typed APIs/handles)
 /// - Bus events
 /// - external events injected by platform adapter
+///
+/// Object-safe: can be used as `Box<dyn Module<E>>`.
 pub trait Module<E: Send + 'static>: Send {
     fn id(&self) -> &'static str;
 
@@ -20,11 +22,11 @@ pub trait Module<E: Send + 'static>: Send {
         Ok(())
     }
 
-    fn update(&mut self, _ctx: &mut ModuleCtx<'_, E>, _frame: &Frame) -> EngineResult<()> {
+    fn fixed_update(&mut self, _ctx: &mut ModuleCtx<'_, E>, _frame: &Frame) -> EngineResult<()> {
         Ok(())
     }
 
-    fn fixed_update(&mut self, _ctx: &mut ModuleCtx<'_, E>, _frame: &Frame) -> EngineResult<()> {
+    fn update(&mut self, _ctx: &mut ModuleCtx<'_, E>, _frame: &Frame) -> EngineResult<()> {
         Ok(())
     }
 

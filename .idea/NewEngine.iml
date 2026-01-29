@@ -4,6 +4,11 @@
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/neocore2/app/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/neocore2/engine_core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/apps/editor/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-modules-cef/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-modules-window-winit/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-platform-winit/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/neocore2/target" />
     </content>
     <orderEntry type="inheritedJdk" />

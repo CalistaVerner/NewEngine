@@ -4,6 +4,7 @@ pub mod error;
 pub mod module;
 pub mod sched;
 pub mod sync;
+mod bus;
 
 pub use engine::Engine;
 pub use frame::Frame;
