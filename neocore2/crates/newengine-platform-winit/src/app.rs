@@ -1,12 +1,14 @@
 use crate::events::WinitExternalEvent;
-use newengine_core::{Engine, EngineError, EngineResult};
+use newengine_core::{Engine, EngineError, EngineResult, WindowHostEvent};
 
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowAttributes},
+    window::{Window, WindowAttributes, WindowId},
 };
 
 struct App<E: Send + 'static> {
@@ -31,6 +33,55 @@ impl<E: Send + 'static> App<E> {
     fn exit(event_loop: &ActiveEventLoop) {
         event_loop.exit();
     }
+
+    #[inline]
+    fn window_size(&self) -> Option<(u32, u32)> {
+        self.window.as_ref().map(|w| {
+            let PhysicalSize { width, height } = w.inner_size();
+            (width, height)
+        })
+    }
+
+    fn emit_window_ready(&mut self) {
+        let Some(w) = &self.window else { return; };
+        let Some((width, height)) = self.window_size() else { return; };
+
+        let window = match w.window_handle() {
+            Ok(h) => h.as_raw(),
+            Err(_) => return,
+        };
+
+        let display = match w.display_handle() {
+            Ok(h) => h.as_raw(),
+            Err(_) => return,
+        };
+
+        let _ = self.engine.dispatch_external_event(&WinitExternalEvent::WindowReady {
+            window,
+            display,
+            width,
+            height,
+        });
+
+        let _ = self.engine.dispatch_external_event(&WindowHostEvent::Ready {
+            window,
+            display,
+            width,
+            height,
+        });
+    }
+
+    #[inline]
+    fn emit_resized(&mut self, width: u32, height: u32) {
+        let _ = self.engine.dispatch_external_event(&WinitExternalEvent::WindowResized { width, height });
+        let _ = self.engine.dispatch_external_event(&WindowHostEvent::Resized { width, height });
+    }
+
+    #[inline]
+    fn emit_focused(&mut self, focused: bool) {
+        let _ = self.engine.dispatch_external_event(&WinitExternalEvent::WindowFocused(focused));
+        let _ = self.engine.dispatch_external_event(&WindowHostEvent::Focused(focused));
+    }
 }
 
 impl<E: Send + 'static> ApplicationHandler for App<E> {
@@ -38,72 +89,66 @@ impl<E: Send + 'static> ApplicationHandler for App<E> {
         let window = event_loop
             .create_window(WindowAttributes::default())
             .expect("window create failed");
+
         self.window = Some(window);
 
-        // Kick first frame.
+        self.emit_window_ready();
         self.request_redraw();
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: winit::window::WindowId,
-        event: WindowEvent,
-    ) {
-        // Detect exit intent before moving the event.
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let close_requested = matches!(event, WindowEvent::CloseRequested);
 
-        let esc_pressed = match &event {
+        let esc_pressed = matches!(
+            &event,
             WindowEvent::KeyboardInput {
-                event:
-                KeyEvent {
+                event: KeyEvent {
                     state: ElementState::Pressed,
                     physical_key: PhysicalKey::Code(KeyCode::Escape),
                     ..
                 },
                 ..
-            } => true,
-            _ => false,
-        };
+            }
+        );
 
-        // Forward event to engine/modules.
-        let _ = self
-            .engine
-            .dispatch_external_event(&WinitExternalEvent::WindowEvent(event));
+        let _ = self.engine.dispatch_external_event(&WinitExternalEvent::WindowEvent(event.clone()));
+
+        match &event {
+            WindowEvent::Resized(PhysicalSize { width, height }) => {
+                self.emit_resized(*width, *height);
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some((w, h)) = self.window_size() {
+                    self.emit_resized(w, h);
+                }
+            }
+            WindowEvent::Focused(f) => {
+                self.emit_focused(*f);
+            }
+            _ => {}
+        }
 
         if close_requested || esc_pressed {
             Self::exit(event_loop);
             return;
         }
 
-        // Ensure we keep rendering after input/resize/etc.
         self.request_redraw();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Drive the engine once per loop iteration.
         match self.engine.step() {
-            Ok(_) => {
-                // Keep pumping frames (simple continuous loop).
-                self.request_redraw();
-            }
-            Err(EngineError::ExitRequested) => {
-                Self::exit(event_loop);
-            }
-            Err(_) => {
-                // Up to you: log error here if desired.
-                Self::exit(event_loop);
-            }
+            Ok(_) => self.request_redraw(),
+            Err(EngineError::ExitRequested) => Self::exit(event_loop),
+            Err(_) => Self::exit(event_loop),
         }
     }
 }
 
-/// Run winit-based application.
-///
-/// The platform crate owns the loop and injects external events into engine.
 pub fn run_winit_app<E: Send + 'static>(engine: Engine<E>) -> EngineResult<()> {
     let event_loop =
         EventLoop::new().map_err(|e| newengine_core::EngineError::Other(e.to_string()))?;
+
     let mut app = App::new(engine);
 
     event_loop

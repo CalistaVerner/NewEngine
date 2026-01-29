@@ -6,6 +6,9 @@ pub mod sched;
 
 pub mod sync;
 mod bus;
+mod host_events;
+pub use host_events::WindowHostEvent;
+
 
 pub use engine::Engine;
 pub use frame::Frame;
