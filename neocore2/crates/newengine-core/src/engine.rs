@@ -5,6 +5,7 @@ use crate::module::{Bus, Module, ModuleCtx, Resources, Services};
 use crate::sched::Scheduler;
 use crate::sync::ShutdownToken;
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,17 @@ impl<E: Send + 'static> Engine<E> {
     #[inline]
     pub fn events(&self) -> &EventHub {
         &self.events
+    }
+
+    /// Emit a typed engine-wide event to the multicast event hub.
+    ///
+    /// This is the preferred way for platform code (winit/CEF/etc.) to deliver host events.
+    #[inline]
+    pub fn emit<T>(&self, event: T) -> EngineResult<()>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.events.publish(event)
     }
 
     pub fn new(
@@ -311,6 +323,7 @@ impl<E: Send + 'static> Engine<E> {
         Ok(frame)
     }
 
+    #[deprecated(note = "Use Engine::emit(...) + EventHub subscriptions instead of synchronous fan-out")]
     pub fn dispatch_external_event(&mut self, event: &dyn std::any::Any) -> EngineResult<()> {
         self.sync_shutdown_state();
         if self.is_exit_requested() {
@@ -338,14 +351,7 @@ impl<E: Send + 'static> Engine<E> {
 
             let module_id = m.id();
 
-            let mut ctx = ModuleCtx::new(
-                services,
-                resources,
-                bus,
-                events,
-                scheduler,
-                exit_requested,
-            );
+            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
 
             m.on_external_event(&mut ctx, event).map_err(|e| {
                 EngineError::with_module_stage(module_id, ModuleStage::ExternalEvent, e)
@@ -419,14 +425,7 @@ impl<E: Send + 'static> Engine<E> {
 
             let module_id = m.id();
 
-            let mut ctx = ModuleCtx::new(
-                services,
-                resources,
-                bus,
-                events,
-                scheduler,
-                exit_requested,
-            );
+            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
             ctx.set_frame(frame);
 
             call(m.as_mut(), &mut ctx)

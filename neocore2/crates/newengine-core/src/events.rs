@@ -1,11 +1,11 @@
-use crate::error::{EngineError, EngineResult};
+use crate::error::EngineResult;
 
 use crossbeam_channel::{Receiver, Sender};
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, Weak,
+    Arc, RwLock, Weak,
 };
 
 /// Multicast event hub with typed subscriptions and optional filters.
@@ -36,7 +36,7 @@ impl EventHub {
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(1),
-                chans: Mutex::new(HashMap::new()),
+                chans: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -165,33 +165,57 @@ struct SubInner {
 
 struct Inner {
     next_id: AtomicU64,
-    chans: Mutex<HashMap<TypeId, Vec<Subscriber>>>,
+    /// Subscriptions are stored as `Arc<Vec<..>>` to make publish fast.
+    ///
+    /// Subscribe/unsubscribe is expected to be rare compared to publish.
+    chans: RwLock<HashMap<TypeId, Arc<Vec<Subscriber>>>>,
 }
 
 impl Inner {
     fn add_subscriber(&self, type_id: TypeId, sub: Subscriber) {
-        let mut map = self.chans.lock().unwrap();
-        map.entry(type_id).or_default().push(sub);
+        let mut map = self.chans.write().unwrap();
+        let next = match map.get(&type_id) {
+            Some(cur) => {
+                let mut v: Vec<Subscriber> = (**cur).clone();
+                v.push(sub);
+                Arc::new(v)
+            }
+            None => Arc::new(vec![sub]),
+        };
+        map.insert(type_id, next);
     }
 
     fn remove_subscriber(&self, type_id: TypeId, sub_id: u64) {
-        let mut map = self.chans.lock().unwrap();
-        let Some(list) = map.get_mut(&type_id) else { return };
-        list.retain(|s| s.id != sub_id);
-        if list.is_empty() {
+        let mut map = self.chans.write().unwrap();
+        let Some(cur) = map.get(&type_id) else { return };
+        if cur.is_empty() {
             map.remove(&type_id);
+            return;
+        }
+
+        let mut v: Vec<Subscriber> = Vec::with_capacity(cur.len().saturating_sub(1));
+        for s in cur.iter() {
+            if s.id != sub_id {
+                v.push(s.clone());
+            }
+        }
+
+        if v.is_empty() {
+            map.remove(&type_id);
+        } else {
+            map.insert(type_id, Arc::new(v));
         }
     }
 
     fn publish_typed(&self, type_id: TypeId, ev: Arc<dyn Any + Send + Sync>) -> EngineResult<()> {
-        let subs_snapshot = {
-            let map = self.chans.lock().unwrap();
+        let subs = {
+            let map = self.chans.read().unwrap();
             map.get(&type_id).cloned()
         };
 
-        let Some(subs) = subs_snapshot else { return Ok(()) };
+        let Some(subs) = subs else { return Ok(()) };
 
-        let mut failed_ids: Vec<u64> = Vec::new();
+        let mut failed: HashSet<u64> = HashSet::new();
 
         for s in subs.iter() {
             if let Some(filter) = &s.filter {
@@ -201,18 +225,28 @@ impl Inner {
             }
 
             if s.tx.send(ev.clone()).is_err() {
-                failed_ids.push(s.id);
+                failed.insert(s.id);
             }
         }
 
-        if !failed_ids.is_empty() {
-            let mut map = self.chans.lock().unwrap();
-            if let Some(list) = map.get_mut(&type_id) {
-                list.retain(|s| !failed_ids.contains(&s.id));
-                if list.is_empty() {
-                    map.remove(&type_id);
-                }
+        if failed.is_empty() {
+            return Ok(());
+        }
+
+        let mut map = self.chans.write().unwrap();
+        let Some(cur) = map.get(&type_id) else { return Ok(()) };
+
+        let mut v: Vec<Subscriber> = Vec::with_capacity(cur.len());
+        for s in cur.iter() {
+            if !failed.contains(&s.id) {
+                v.push(s.clone());
             }
+        }
+
+        if v.is_empty() {
+            map.remove(&type_id);
+        } else {
+            map.insert(type_id, Arc::new(v));
         }
 
         Ok(())
@@ -224,17 +258,4 @@ struct Subscriber {
     id: u64,
     tx: Sender<Arc<dyn Any + Send + Sync>>,
     filter: Option<Arc<dyn Fn(&Arc<dyn Any + Send + Sync>) -> bool + Send + Sync>>,
-}
-
-trait SenderExt {
-    fn is_disconnected(&self) -> bool;
-}
-
-impl SenderExt for Sender<Arc<dyn Any + Send + Sync>> {
-    #[inline]
-    fn is_disconnected(&self) -> bool {
-        // crossbeam Sender has no direct "is_closed"; try_send to detect is expensive.
-        // We rely on the `send` failure path in publish and then prune.
-        false
-    }
 }
