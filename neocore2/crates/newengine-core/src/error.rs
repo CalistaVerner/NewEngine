@@ -11,6 +11,7 @@ pub enum EngineError {
 
     /// Error produced by a module during a known lifecycle stage.
     Module {
+        module_id: &'static str,
         stage: ModuleStage,
         cause: Box<EngineError>,
     },
@@ -38,10 +39,11 @@ impl EngineError {
     }
 
     #[inline]
-    pub fn with_stage(stage: ModuleStage, err: EngineError) -> Self {
+    pub fn with_module_stage(module_id: &'static str, stage: ModuleStage, err: EngineError) -> Self {
         match err {
             EngineError::ExitRequested => EngineError::ExitRequested,
             other => EngineError::Module {
+                module_id,
                 stage,
                 cause: Box::new(other),
             },
@@ -54,9 +56,11 @@ impl fmt::Display for EngineError {
         match self {
             EngineError::ExitRequested => write!(f, "exit requested"),
             EngineError::Other(s) => write!(f, "{s}"),
-            EngineError::Module { stage, cause } => {
-                write!(f, "module stage {stage:?}: {cause}")
-            }
+            EngineError::Module {
+                module_id,
+                stage,
+                cause,
+            } => write!(f, "module '{module_id}' stage {stage:?}: {cause}"),
         }
     }
 }

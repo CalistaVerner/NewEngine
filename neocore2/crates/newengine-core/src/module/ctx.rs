@@ -1,18 +1,19 @@
+use crate::events::EventHub;
 use crate::frame::Frame;
 use crate::module::{Bus, Resources, Services};
 use crate::sched::Scheduler;
 
 /// Context passed to modules.
 ///
-/// This prevents modules from taking `&mut Engine` (god object problem).
+/// This prevents modules from taking `&mut Engine`.
 pub struct ModuleCtx<'a, E: Send + 'static> {
     services: &'a dyn Services,
     resources: &'a mut Resources,
     bus: &'a Bus<E>,
+    events: &'a EventHub,
     scheduler: &'a mut Scheduler,
     exit: &'a mut bool,
 
-    /// Frame snapshot for the current stage (stored by value).
     frame: Option<Frame>,
 }
 
@@ -22,6 +23,7 @@ impl<'a, E: Send + 'static> ModuleCtx<'a, E> {
         services: &'a dyn Services,
         resources: &'a mut Resources,
         bus: &'a Bus<E>,
+        events: &'a EventHub,
         scheduler: &'a mut Scheduler,
         exit: &'a mut bool,
     ) -> Self {
@@ -29,19 +31,18 @@ impl<'a, E: Send + 'static> ModuleCtx<'a, E> {
             services,
             resources,
             bus,
+            events,
             scheduler,
             exit,
             frame: None,
         }
     }
 
-    /// Attaches a frame snapshot to the context.
     #[inline]
     pub fn set_frame(&mut self, frame: &Frame) {
         self.frame = Some(*frame);
     }
 
-    /// Returns the current frame snapshot, if attached.
     #[inline]
     pub fn frame(&self) -> Option<&Frame> {
         self.frame.as_ref()
@@ -57,9 +58,16 @@ impl<'a, E: Send + 'static> ModuleCtx<'a, E> {
         self.resources
     }
 
+    /// Commands queue (single-consumer by rules).
     #[inline]
     pub fn bus(&self) -> &Bus<E> {
         self.bus
+    }
+
+    /// Multicast events hub (pub/sub).
+    #[inline]
+    pub fn events(&self) -> &EventHub {
+        self.events
     }
 
     #[inline]
