@@ -9,6 +9,7 @@ use crate::system_info::SystemInfo;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 pub struct Engine<E: Send + 'static> {
@@ -33,6 +34,37 @@ pub struct Engine<E: Send + 'static> {
     started: bool,
     last: Instant,
     acc: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Elapsed {
+    value: u128,
+    unit: &'static str, // "us" | "ms"
+}
+
+impl Elapsed {
+    #[inline]
+    fn from_duration(d: Duration) -> Self {
+        let us = d.as_micros();
+        if us < 1000 {
+            Self {
+                value: us,
+                unit: "us",
+            }
+        } else {
+            Self {
+                value: d.as_millis(),
+                unit: "ms",
+            }
+        }
+    }
+}
+
+impl fmt::Display for Elapsed {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "elapsed_{}={}", self.unit, self.value)
+    }
 }
 
 impl<E: Send + 'static> Engine<E> {
@@ -117,38 +149,59 @@ impl<E: Send + 'static> Engine<E> {
         Ok(())
     }
 
+    #[inline]
+    fn elapsed_since(t0: Instant) -> Elapsed {
+        Elapsed::from_duration(t0.elapsed())
+    }
+
+    #[inline]
+    fn log_phase_begin(scope: &'static str, phase: &'static str, count: Option<usize>) {
+        match count {
+            Some(n) => log::info!("{scope}: starting (phase={phase} count={n})"),
+            None => log::info!("{scope}: starting (phase={phase})"),
+        }
+    }
+
+    #[inline]
+    fn log_phase_ok(
+        scope: &'static str,
+        phase: &'static str,
+        count: Option<usize>,
+        elapsed: Elapsed,
+    ) {
+        match count {
+            Some(n) => log::info!("{scope}: done (phase={phase} count={n} {elapsed})"),
+            None => log::info!("{scope}: done (phase={phase} {elapsed})"),
+        }
+    }
+
+    #[inline]
+    fn phase_err(phase: &'static str, elapsed: Elapsed, e: impl fmt::Display) -> EngineError {
+        EngineError::Other(format!("plugins: failed (phase={phase} {elapsed}): {e}"))
+    }
+
     fn try_load_plugins_once(&mut self) -> EngineResult<()> {
         if self.plugins_loaded {
             log::debug!("plugins: load skipped (already loaded)");
             return Ok(());
         }
 
+        let phase = "load_default";
+        Self::log_phase_begin("plugins", phase, None);
         let t0 = Instant::now();
-        log::info!("plugins: loading (phase=load_default)");
 
         let host = default_host_api();
 
         if let Err(e) = self.plugins.load_default(host) {
-            let elapsed_ms = t0.elapsed().as_millis();
-            return Err(EngineError::Other(format!(
-                "plugins: load failed (phase=load_default elapsed_ms={elapsed_ms}): {e}"
-            )));
+            return Err(Self::phase_err(phase, Self::elapsed_since(t0), e));
         }
 
         self.plugins_loaded = true;
 
-        let elapsed_ms = t0.elapsed().as_millis();
-        // We can’t know candidate count here unless PluginManager exposes it, but we can show loaded.
         let loaded = self.plugins.iter().count();
-        log::info!(
-        "plugins: loaded (phase=load_default loaded={} elapsed_ms={})",
-        loaded,
-        elapsed_ms
-    );
-
+        Self::log_phase_ok("plugins", phase, Some(loaded), Self::elapsed_since(t0));
         Ok(())
     }
-
 
     pub fn start(&mut self) -> EngineResult<()> {
         self.started = true;
@@ -318,68 +371,64 @@ impl<E: Send + 'static> Engine<E> {
         }
 
         self.modules = sorted;
+
         log::info!(
-                "engine: starting fixed_dt_ms={} modules={}",
-                (self.fixed_dt * 1000.0).round() as u32,
-                self.modules.len()
-            );
+            "engine: starting fixed_dt_ms={} modules={}",
+            (self.fixed_dt * 1000.0).round() as u32,
+            self.modules.len()
+        );
+
         let si = SystemInfo::collect();
         si.log();
-        // IMPORTANT: plugins are loaded after modules start, so the logger module is already installed.
-        self.try_load_plugins_once()?;
 
         // IMPORTANT: plugins are loaded after modules start, so the logger module is already installed.
         self.try_load_plugins_once()?;
 
         // Register/announce loaded plugins (stable, readable logging)
+        let phase = "register";
         let t_reg0 = Instant::now();
-        let mut list: Vec<(String, String)> = Vec::new();
 
+        let mut list: Vec<(String, String)> = Vec::new();
         for p in self.plugins.iter() {
             let info = p.info();
             list.push((info.id.to_string(), info.version.to_string()));
         }
-
         list.sort_by(|a, b| a.0.cmp(&b.0));
 
-        log::info!(
-    "plugins: registering (phase=register count={})",
-    list.len()
-);
+        Self::log_phase_begin("plugins", phase, Some(list.len()));
 
         for (i, (id, ver)) in list.iter().enumerate() {
             log::info!(
-        "plugins: registered [{:02}/{:02}] id='{}' ver='{}'",
-        i.saturating_add(1),
-        list.len().max(1),
-        id,
-        ver
-    );
+                "plugins: registered [{:02}/{:02}] id='{}' ver='{}'",
+                i.saturating_add(1),
+                list.len().max(1),
+                id,
+                ver
+            );
         }
 
-        log::info!(
-    "plugins: registered (phase=register count={} elapsed_ms={})",
-    list.len(),
-    t_reg0.elapsed().as_millis()
-);
+        Self::log_phase_ok(
+            "plugins",
+            phase,
+            Some(list.len()),
+            Self::elapsed_since(t_reg0),
+        );
 
         // Start plugins
+        let phase = "start_all";
         let t_start0 = Instant::now();
-        log::info!("plugins: starting (phase=start_all count={})", list.len());
+        Self::log_phase_begin("plugins", phase, Some(list.len()));
 
         if let Err(e) = self.plugins.start_all() {
-            let elapsed_ms = t_start0.elapsed().as_millis();
-            return Err(EngineError::Other(format!(
-                "plugins: start failed (phase=start_all elapsed_ms={elapsed_ms}): {e}"
-            )));
+            return Err(Self::phase_err(phase, Self::elapsed_since(t_start0), e));
         }
 
-        log::info!(
-    "plugins: started (phase=start_all count={} elapsed_ms={})",
-    list.len(),
-    t_start0.elapsed().as_millis()
-);
-
+        Self::log_phase_ok(
+            "plugins",
+            phase,
+            Some(list.len()),
+            Self::elapsed_since(t_start0),
+        );
 
         Ok(())
     }

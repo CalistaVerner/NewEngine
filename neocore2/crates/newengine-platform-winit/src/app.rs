@@ -20,17 +20,40 @@ pub struct WinitWindowHandles {
     pub display: RawDisplayHandle,
 }
 
-struct App<E: Send + 'static> {
+/// Initial window size snapshot taken right after window creation.
+/// Vulkan swapchain bootstrap needs it without storing `winit::Window`.
+#[derive(Debug, Clone, Copy)]
+pub struct WinitWindowInitSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+struct App<E, F>
+where
+    E: Send + 'static,
+    F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
+{
     engine: Engine<E>,
+    after_window: Option<F>,
+    started: bool,
+    fatal: Option<EngineError>,
+
     window: Option<Window>,
     last_cursor_pos: Option<(f32, f32)>,
 }
 
-impl<E: Send + 'static> App<E> {
+impl<E, F> App<E, F>
+where
+    E: Send + 'static,
+    F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
+{
     #[inline]
-    fn new(engine: Engine<E>) -> Self {
+    fn new(engine: Engine<E>, after_window: F) -> Self {
         Self {
             engine,
+            after_window: Some(after_window),
+            started: false,
+            fatal: None,
             window: None,
             last_cursor_pos: None,
         }
@@ -74,22 +97,41 @@ impl<E: Send + 'static> App<E> {
             .insert(WinitWindowHandles { window, display });
     }
 
-    fn emit_ready(&mut self) {
-        let Some((width, height)) = self.window_size() else { return };
+    fn install_window_init_size_resource(&mut self) {
+        let Some((width, height)) = self.window_size() else {
+            return;
+        };
+        self.engine
+            .resources_mut()
+            .insert(WinitWindowInitSize { width, height });
+    }
 
-        let _ = self.engine
+    fn emit_ready(&mut self) {
+        let Some((width, height)) = self.window_size() else {
+            return;
+        };
+
+        let _ = self
+            .engine
             .events()
             .publish(HostEvent::Window(WindowHostEvent::Ready { width, height }));
     }
 
     #[inline]
     fn emit_resized(&mut self, width: u32, height: u32) {
-        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Resized { width, height }));
+        let _ = self
+            .engine
+            .emit(HostEvent::Window(WindowHostEvent::Resized {
+                width,
+                height,
+            }));
     }
 
     #[inline]
     fn emit_focused(&mut self, focused: bool) {
-        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
+        let _ = self
+            .engine
+            .emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
     }
 
     #[inline]
@@ -180,17 +222,49 @@ impl<E: Send + 'static> App<E> {
             ElementState::Released => KeyState::Released,
         }
     }
+
+    fn set_fatal_and_exit(&mut self, event_loop: &ActiveEventLoop, e: EngineError) {
+        log::error!("winit host fatal: {e}");
+        self.fatal = Some(e);
+        Self::exit(event_loop);
+    }
 }
 
-impl<E: Send + 'static> ApplicationHandler for App<E> {
+impl<E, F> ApplicationHandler for App<E, F>
+where
+    E: Send + 'static,
+    F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
+{
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(WindowAttributes::default())
-            .expect("window create failed");
+        let window = match event_loop.create_window(WindowAttributes::default()) {
+            Ok(w) => w,
+            Err(e) => {
+                self.set_fatal_and_exit(event_loop, EngineError::Other(e.to_string()));
+                return;
+            }
+        };
 
         self.window = Some(window);
 
+        // Insert raw handles + initial size BEFORE registering modules and engine.start()
         self.install_window_handles_resource();
+        self.install_window_init_size_resource();
+
+        if let Some(after) = self.after_window.take() {
+            if let Err(e) = after(&mut self.engine) {
+                self.set_fatal_and_exit(event_loop, e);
+                return;
+            }
+        }
+
+        if !self.started {
+            if let Err(e) = self.engine.start() {
+                self.set_fatal_and_exit(event_loop, e);
+                return;
+            }
+            self.started = true;
+        }
+
         self.emit_ready();
         self.request_redraw();
     }
@@ -221,7 +295,6 @@ impl<E: Send + 'static> ApplicationHandler for App<E> {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 let state = Self::map_state(event.state);
-
                 let repeat = event.repeat;
 
                 let code = match event.physical_key {
@@ -250,10 +323,12 @@ impl<E: Send + 'static> ApplicationHandler for App<E> {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseButton {
-                    button: Self::map_mouse_button(button),
-                    state: Self::map_state(state),
-                }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseButton {
+                        button: Self::map_mouse_button(button),
+                        state: Self::map_state(state),
+                    }));
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -261,35 +336,42 @@ impl<E: Send + 'static> ApplicationHandler for App<E> {
                     MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseWheel {
-                    dx,
-                    dy,
-                }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 if let Some((px, py)) = self.last_cursor_pos {
-                    let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseDelta {
-                        dx: x - px,
-                        dy: y - py,
-                    }));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Input(InputHostEvent::MouseDelta {
+                            dx: x - px,
+                            dy: y - py,
+                        }));
                 }
                 self.last_cursor_pos = Some((x, y));
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
             }
 
             WindowEvent::Ime(ime) => match ime {
                 Ime::Commit(text) => {
-                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
                 }
                 Ime::Preedit(text, _) => {
-                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
                 }
                 Ime::Enabled => {}
                 Ime::Disabled => {}
-            }
+            },
 
             _ => {}
         }
@@ -298,17 +380,36 @@ impl<E: Send + 'static> ApplicationHandler for App<E> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.fatal.is_some() {
+            Self::exit(event_loop);
+            return;
+        }
+        if !self.started {
+            self.request_redraw();
+            return;
+        }
+
         match self.engine.step() {
             Ok(_) => self.request_redraw(),
             Err(EngineError::ExitRequested) => Self::exit(event_loop),
-            Err(_) => Self::exit(event_loop),
+            Err(e) => {
+                log::error!("engine.step failed: {e}");
+                Self::exit(event_loop)
+            }
         }
     }
 }
 
-pub fn run_winit_app<E: Send + 'static>(engine: Engine<E>) -> EngineResult<()> {
+/// Runs winit host and starts the engine *after* the window is created.
+/// `after_window` is called once, right after inserting `WinitWindowHandles` + `WinitWindowInitSize` into Resources.
+/// Use it to register modules that require window handles (Vulkan, CEF, etc.).
+pub fn run_winit_app<E, F>(engine: Engine<E>, after_window: F) -> EngineResult<()>
+where
+    E: Send + 'static,
+    F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
+{
     let event_loop = EventLoop::new().map_err(|e| EngineError::Other(e.to_string()))?;
-    let mut app = App::new(engine);
+    let mut app = App::new(engine, after_window);
 
     event_loop
         .run_app(&mut app)

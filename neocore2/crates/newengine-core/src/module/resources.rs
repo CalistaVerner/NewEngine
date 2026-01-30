@@ -19,8 +19,8 @@ pub struct Resources {
 
 impl Resources {
     /* ============================
-       Typed storage (TypeId)
-       ============================ */
+    Typed storage (TypeId)
+    ============================ */
 
     #[inline]
     pub fn insert<T>(&mut self, value: T)
@@ -93,8 +93,8 @@ impl Resources {
     }
 
     /* ============================
-       Named APIs (string id)
-       ============================ */
+    Named APIs (string id)
+    ============================ */
 
     #[inline]
     pub fn register_api<T>(&mut self, id: &'static str, api: T) -> EngineResult<()>

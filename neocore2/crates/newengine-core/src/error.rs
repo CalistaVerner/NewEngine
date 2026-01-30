@@ -39,7 +39,11 @@ impl EngineError {
     }
 
     #[inline]
-    pub fn with_module_stage(module_id: &'static str, stage: ModuleStage, err: EngineError) -> Self {
+    pub fn with_module_stage(
+        module_id: &'static str,
+        stage: ModuleStage,
+        err: EngineError,
+    ) -> Self {
         match err {
             EngineError::ExitRequested => EngineError::ExitRequested,
             other => EngineError::Module {

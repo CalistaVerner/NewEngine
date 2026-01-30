@@ -1,3 +1,2 @@
-mod app;
-
-pub use app::run_winit_app;
+pub mod app;
+pub use app::{run_winit_app, WinitWindowHandles, WinitWindowInitSize};

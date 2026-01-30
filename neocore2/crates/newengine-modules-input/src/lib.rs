@@ -1,9 +1,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use abi_stable::erased_types::TD_Opaque;
-use abi_stable::std_types::{RBox, RResult, RString};
-use abi_stable::{export_root_module, sabi_extern_fn, StableAbi};
 use abi_stable::derive_macro_reexports::PrefixTypeTrait;
+use abi_stable::erased_types::TD_Opaque;
+use abi_stable::std_types::{RBox, ROption, RResult, RString};
+use abi_stable::{export_root_module, sabi_extern_fn, StableAbi};
+
 use newengine_plugin_api::{
     HostApiV1, PluginInfo, PluginModule, PluginModule_TO, PluginRootV1, PluginRootV1_Ref,
 };
@@ -11,7 +12,7 @@ use newengine_plugin_api::{
 #[derive(StableAbi)]
 #[repr(C)]
 pub struct InputPlugin {
-    host: Option<RBox<HostApiV1>>,
+    host: ROption<RBox<HostApiV1>>,
     tick: u64,
     last_log_ns: u64,
 }
@@ -19,7 +20,7 @@ pub struct InputPlugin {
 impl Default for InputPlugin {
     fn default() -> Self {
         Self {
-            host: None,
+            host: ROption::RNone,
             tick: 0,
             last_log_ns: 0,
         }
@@ -27,19 +28,22 @@ impl Default for InputPlugin {
 }
 
 impl InputPlugin {
-    #[inline]
+    #[inline(always)]
     fn host(&self) -> Option<&HostApiV1> {
-        self.host.as_deref()
+        match &self.host {
+            ROption::RSome(h) => Some(h.as_ref()),
+            ROption::RNone => None,
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     fn log_info(&self, msg: impl Into<RString>) {
         if let Some(h) = self.host() {
             (h.log_info)(msg.into());
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn now_ns(&self) -> Option<u64> {
         self.host().map(|h| (h.monotonic_time_ns)())
     }
@@ -54,16 +58,16 @@ impl PluginModule for InputPlugin {
     }
 
     fn init(&mut self, host: HostApiV1) -> RResult<(), RString> {
-        self.host = Some(RBox::new(host));
+        self.host = ROption::RSome(RBox::new(host));
         self.tick = 0;
         self.last_log_ns = self.now_ns().unwrap_or(0);
 
-        self.log_info("input plugin: init");
+        self.log_info("input plugin: init, HELLO from Kayla <3");
         RResult::ROk(())
     }
 
     fn start(&mut self) -> RResult<(), RString> {
-        if self.host.is_none() {
+        if matches!(self.host, ROption::RNone) {
             return RResult::RErr(RString::from("input plugin: start called before init"));
         }
 
@@ -78,21 +82,28 @@ impl PluginModule for InputPlugin {
     fn update(&mut self, _dt: f32) -> RResult<(), RString> {
         self.tick = self.tick.wrapping_add(1);
 
-        if let Some(now) = self.now_ns() {
-            // Log every 500 ms to avoid spam when tick rate changes.
-            const LOG_INTERVAL_NS: u64 = 500_000_000;
+        let now = match self.now_ns() {
+            Some(v) => v,
+            None => return RResult::ROk(()),
+        };
 
-            if now.wrapping_sub(self.last_log_ns) >= LOG_INTERVAL_NS {
-                self.last_log_ns = now;
+        const LOG_INTERVAL_NS: u64 = 500_000_000;
 
-                if let Some(h) = self.host() {
-                    (h.log_info)(RString::from(format!(
-                        "input plugin: update tick={} time_ns={}",
-                        self.tick, now
-                    )));
-                }
-            }
+        if now < self.last_log_ns + LOG_INTERVAL_NS {
+            return RResult::ROk(());
         }
+
+        self.last_log_ns = now;
+
+        let host = match self.host() {
+            Some(h) => h,
+            None => return RResult::ROk(()),
+        };
+
+        (host.log_info)(RString::from(format!(
+            "input plugin: update tick={} time_ns={}",
+            self.tick, now
+        )));
 
         RResult::ROk(())
     }
@@ -103,7 +114,7 @@ impl PluginModule for InputPlugin {
 
     fn shutdown(&mut self) {
         self.log_info("input plugin: shutdown");
-        self.host = None;
+        self.host = ROption::RNone;
     }
 }
 
@@ -114,5 +125,8 @@ fn create_plugin() -> PluginModule_TO<'static, RBox<()>> {
 
 #[export_root_module]
 pub fn newengine_plugin_root() -> PluginRootV1_Ref {
-    PluginRootV1 { create: create_plugin }.leak_into_prefix()
+    PluginRootV1 {
+        create: create_plugin,
+    }
+    .leak_into_prefix()
 }

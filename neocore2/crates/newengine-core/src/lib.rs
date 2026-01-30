@@ -5,9 +5,9 @@ pub mod events;
 pub mod frame;
 pub mod host_events;
 pub mod module;
+mod plugins;
 pub mod sched;
 pub mod sync;
-mod plugins;
 mod system_info;
 
 pub use bus::Bus;

@@ -1,10 +1,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+use abi_stable::library::RootModule;
+use abi_stable::std_types::RString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
-use abi_stable::library::RootModule;
-use abi_stable::std_types::RString;
 
 use newengine_plugin_api::{HostApiV1, PluginInfo, PluginModule_TO, PluginRootV1_Ref};
 
@@ -58,7 +58,10 @@ impl PluginManager {
                 "plugins: create_dir_all('{}') failed: {e}",
                 dir.display()
             )));
-            return Err(format!("plugins: create_dir_all('{}') failed: {e}", dir.display()));
+            return Err(format!(
+                "plugins: create_dir_all('{}') failed: {e}",
+                dir.display()
+            ));
         }
 
         let mut libs: Vec<PathBuf> = Vec::new();
@@ -153,10 +156,9 @@ impl PluginManager {
 
     pub fn fixed_update_all(&mut self, dt: f32) -> Result<(), String> {
         for p in self.plugins.iter_mut() {
-            p.module
-                .fixed_update(dt)
-                .into_result()
-                .map_err(|e| format!("plugins: fixed_update failed for id='{}': {}", p.info.id, e))?;
+            p.module.fixed_update(dt).into_result().map_err(|e| {
+                format!("plugins: fixed_update failed for id='{}': {}", p.info.id, e)
+            })?;
         }
         Ok(())
     }

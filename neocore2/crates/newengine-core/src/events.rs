@@ -205,8 +205,12 @@ where
     T: Any + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        let Some(inner) = self.inner.take() else { return };
-        let Some(hub) = inner.hub.upgrade() else { return };
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let Some(hub) = inner.hub.upgrade() else {
+            return;
+        };
         hub.remove_subscriber(inner.type_id, inner.sub_id);
     }
 }
@@ -294,7 +298,9 @@ impl Inner {
         }
 
         let mut map = self.chans.write().expect("EventHub channels poisoned");
-        let Some(cur) = map.get(&type_id) else { return Ok(()) };
+        let Some(cur) = map.get(&type_id) else {
+            return Ok(());
+        };
 
         let mut v: Vec<Subscriber> = Vec::with_capacity(cur.len());
         for s in cur.iter() {

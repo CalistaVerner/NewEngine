@@ -14,7 +14,9 @@ pub struct ShutdownToken {
 impl ShutdownToken {
     #[inline]
     pub fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[inline]
