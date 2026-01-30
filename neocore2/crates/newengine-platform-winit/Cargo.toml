@@ -5,6 +5,5 @@ edition = "2021"
 
 [dependencies]
 winit = "0.30"
-softbuffer = "0.4"
 newengine-core = { path = "../newengine-core" }
 raw-window-handle = "0.6.2"

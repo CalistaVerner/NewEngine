@@ -25,6 +25,7 @@ pub struct Engine<E: Send + 'static> {
     exit_requested: bool,
 
     frame_index: u64,
+    fixed_tick: u64,
     started: bool,
     last: Instant,
     acc: f32,
@@ -74,6 +75,7 @@ impl<E: Send + 'static> Engine<E> {
             shutdown,
             exit_requested: false,
             frame_index: 0,
+            fixed_tick: 0,
             started: false,
             last: Instant::now(),
             acc: 0.0,
@@ -287,18 +289,28 @@ impl<E: Send + 'static> Engine<E> {
 
         self.acc = (self.acc + dt).min(self.fixed_dt * 8.0);
 
-        let mut fixed_steps = 0u32;
+        // Timing contract:
+        // - begin_frame() runs first (can enqueue work for this frame)
+        // - then fixed_update() substeps
+        // - then update() and render()
+        // - finally end_frame()
+        self.scheduler.begin_frame(Duration::from_secs_f32(dt));
 
-        while self.acc >= self.fixed_dt {
+        let mut steps_to_run = (self.acc / self.fixed_dt).floor() as u32;
+        steps_to_run = steps_to_run.min(8);
+
+        for step_index in 0..steps_to_run {
             self.acc -= self.fixed_dt;
-            fixed_steps = fixed_steps.saturating_add(1);
+            self.fixed_tick = self.fixed_tick.wrapping_add(1);
 
             let fixed_frame = Frame {
                 frame_index: self.frame_index,
                 dt: self.fixed_dt,
                 fixed_dt: self.fixed_dt,
                 fixed_alpha: 0.0,
-                fixed_steps: 1,
+                fixed_step_count: steps_to_run,
+                fixed_step_index: step_index,
+                fixed_tick: self.fixed_tick,
             };
 
             self.run_stage(&fixed_frame, ModuleStage::FixedUpdate, |m, ctx| m.fixed_update(ctx))?;
@@ -309,13 +321,14 @@ impl<E: Send + 'static> Engine<E> {
             dt,
             fixed_dt: self.fixed_dt,
             fixed_alpha: (self.acc / self.fixed_dt).clamp(0.0, 0.999_999),
-            fixed_steps,
+            fixed_step_count: steps_to_run,
+            fixed_step_index: 0,
+            fixed_tick: self.fixed_tick,
         };
 
         self.run_stage(&frame, ModuleStage::Update, |m, ctx| m.update(ctx))?;
         self.run_stage(&frame, ModuleStage::Render, |m, ctx| m.render(ctx))?;
-
-        self.scheduler.tick(Duration::from_secs_f32(dt));
+        self.scheduler.end_frame(Duration::from_secs_f32(dt));
         self.frame_index = self.frame_index.wrapping_add(1);
 
         Ok(frame)

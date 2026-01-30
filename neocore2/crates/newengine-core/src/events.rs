@@ -1,6 +1,6 @@
 use crate::error::EngineResult;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -8,7 +8,28 @@ use std::sync::{
     Arc, RwLock, Weak,
 };
 
+/// Overflow policy for bounded subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// If the queue is full, silently drop the newly published event.
+    DropNewest,
+    /// Block the publisher until the subscriber makes room.
+    ///
+    /// Use with care: it can deadlock if you publish from the same thread
+    /// that is expected to drain the subscription.
+    Block,
+}
+
+impl Default for OverflowPolicy {
+    #[inline]
+    fn default() -> Self {
+        OverflowPolicy::DropNewest
+    }
+}
+
 /// Multicast event hub with typed subscriptions and optional filters.
+///
+/// Backpressure is supported via bounded subscriptions with explicit overflow policies.
 ///
 /// Optimized for cheap publish:
 /// - subscriber lists are stored as `Arc<Vec<Subscriber>>`
@@ -46,12 +67,24 @@ impl EventHub {
     }
 
     /// Subscribe to a typed event stream.
+    ///
+    /// The default subscription is **bounded** with `OverflowPolicy::DropNewest`.
+    /// This prevents unbounded memory growth if a subscriber stalls.
     #[inline]
     pub fn subscribe<T>(&self) -> EventSub<T>
     where
         T: Any + Send + Sync + 'static,
     {
-        self.subscribe_filtered::<T, _>(|_| true)
+        self.subscribe_bounded::<T>(1024, OverflowPolicy::DropNewest)
+    }
+
+    /// Subscribe to a typed event stream with a bounded queue.
+    #[inline]
+    pub fn subscribe_bounded<T>(&self, capacity: usize, overflow: OverflowPolicy) -> EventSub<T>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.subscribe_filtered_bounded::<T, _>(capacity, overflow, |_| true)
     }
 
     /// Subscribe with a filter predicate.
@@ -63,9 +96,26 @@ impl EventHub {
         T: Any + Send + Sync + 'static,
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let (tx, rx) = crossbeam_channel::unbounded::<Arc<dyn Any + Send + Sync>>();
+        self.subscribe_filtered_bounded::<T, F>(1024, OverflowPolicy::DropNewest, filter)
+    }
+
+    /// Subscribe with a filter predicate and a bounded queue.
+    #[inline]
+    pub fn subscribe_filtered_bounded<T, F>(
+        &self,
+        capacity: usize,
+        overflow: OverflowPolicy,
+        filter: F,
+    ) -> EventSub<T>
+    where
+        T: Any + Send + Sync + 'static,
+        F: Fn(&T) -> bool + Send + Sync + 'static,
+    {
+        let cap = capacity.max(1);
+        let (tx, rx) = crossbeam_channel::bounded::<Arc<dyn Any + Send + Sync>>(cap);
 
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let dropped = Arc::new(AtomicU64::new(0));
 
         let filter_arc: Arc<dyn Fn(&Arc<dyn Any + Send + Sync>) -> bool + Send + Sync> =
             Arc::new(move |a: &Arc<dyn Any + Send + Sync>| {
@@ -81,6 +131,8 @@ impl EventHub {
             Subscriber {
                 id,
                 tx,
+                overflow,
+                dropped: dropped.clone(),
                 filter: Some(filter_arc),
             },
         );
@@ -92,6 +144,7 @@ impl EventHub {
                 sub_id: id,
             }),
             rx,
+            dropped,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -105,6 +158,7 @@ where
 {
     inner: Option<SubInner>,
     rx: Receiver<Arc<dyn Any + Send + Sync>>,
+    dropped: Arc<AtomicU64>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -112,6 +166,12 @@ impl<T> EventSub<T>
 where
     T: Any + Send + Sync + 'static,
 {
+    /// Number of events dropped due to overflow on this subscription.
+    #[inline]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub fn try_recv(&self) -> Option<Arc<T>> {
         let a = self.rx.try_recv().ok()?;
@@ -164,7 +224,7 @@ struct Inner {
 
 impl Inner {
     fn add_subscriber(&self, type_id: TypeId, sub: Subscriber) {
-        let mut map = self.chans.write().unwrap();
+        let mut map = self.chans.write().expect("EventHub channels poisoned");
         let next = match map.get(&type_id) {
             Some(cur) => {
                 let mut v: Vec<Subscriber> = (**cur).clone();
@@ -177,7 +237,7 @@ impl Inner {
     }
 
     fn remove_subscriber(&self, type_id: TypeId, sub_id: u64) {
-        let mut map = self.chans.write().unwrap();
+        let mut map = self.chans.write().expect("EventHub channels poisoned");
         let Some(cur) = map.get(&type_id) else { return };
 
         let mut v: Vec<Subscriber> = Vec::with_capacity(cur.len().saturating_sub(1));
@@ -196,7 +256,7 @@ impl Inner {
 
     fn publish_typed(&self, type_id: TypeId, ev: Arc<dyn Any + Send + Sync>) -> EngineResult<()> {
         let subs = {
-            let map = self.chans.read().unwrap();
+            let map = self.chans.read().expect("EventHub channels poisoned");
             map.get(&type_id).cloned()
         };
 
@@ -211,8 +271,21 @@ impl Inner {
                 }
             }
 
-            if s.tx.send(ev.clone()).is_err() {
-                failed.insert(s.id);
+            match s.overflow {
+                OverflowPolicy::Block => {
+                    if s.tx.send(ev.clone()).is_err() {
+                        failed.insert(s.id);
+                    }
+                }
+                OverflowPolicy::DropNewest => match s.tx.try_send(ev.clone()) {
+                    Ok(_) => {}
+                    Err(TrySendError::Full(_)) => {
+                        s.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        failed.insert(s.id);
+                    }
+                },
             }
         }
 
@@ -220,7 +293,7 @@ impl Inner {
             return Ok(());
         }
 
-        let mut map = self.chans.write().unwrap();
+        let mut map = self.chans.write().expect("EventHub channels poisoned");
         let Some(cur) = map.get(&type_id) else { return Ok(()) };
 
         let mut v: Vec<Subscriber> = Vec::with_capacity(cur.len());
@@ -244,5 +317,7 @@ impl Inner {
 struct Subscriber {
     id: u64,
     tx: Sender<Arc<dyn Any + Send + Sync>>,
+    overflow: OverflowPolicy,
+    dropped: Arc<AtomicU64>,
     filter: Option<Arc<dyn Fn(&Arc<dyn Any + Send + Sync>) -> bool + Send + Sync>>,
 }

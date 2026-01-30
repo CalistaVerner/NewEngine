@@ -7,6 +7,7 @@ pub mod host_events;
 pub mod module;
 pub mod sched;
 pub mod sync;
+mod plugins;
 
 pub use bus::Bus;
 pub use engine::Engine;

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::{info, warn};
+use newengine_core::events::OverflowPolicy;
 use newengine_core::host_events::{HostEvent, KeyCode};
 use newengine_core::{EngineResult, Module, ModuleCtx};
 
@@ -81,7 +82,9 @@ impl<E: Send + 'static> Module<E> for InputHandlerModule {
     }
 
     fn init(&mut self, ctx: &mut ModuleCtx<'_, E>) -> EngineResult<()> {
-        self.sub = Some(ctx.events().subscribe::<HostEvent>());
+        // Input events can burst during focus changes or IME composition.
+        // Bounded subscription prevents unbounded memory growth if the module stalls.
+        self.sub = Some(ctx.events().subscribe_bounded::<HostEvent>(4096, OverflowPolicy::DropNewest));
 
         let api: Arc<dyn InputApi> = self.api.clone();
         ctx.resources_mut().insert::<Arc<dyn InputApi>>(api);
