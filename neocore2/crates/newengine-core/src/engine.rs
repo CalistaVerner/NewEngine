@@ -95,8 +95,10 @@ impl<E: Send + 'static> Engine<E> {
 
     pub fn register_module(&mut self, module: Box<dyn Module<E>>) -> EngineResult<()> {
         self.sync_shutdown_state();
+        self.ensure_not_started()?;
 
         let id = module.id();
+        self.validate_module_descriptor(id, module.dependencies())?;
         if self.module_ids.contains(id) {
             return Err(EngineError::Other(format!("module already registered: {id}")));
         }
@@ -107,6 +109,7 @@ impl<E: Send + 'static> Engine<E> {
     }
 
     pub fn start(&mut self) -> EngineResult<()> {
+        self.ensure_not_started()?;
         self.started = true;
         self.last = Instant::now();
         self.sync_shutdown_state();
@@ -261,6 +264,47 @@ impl<E: Send + 'static> Engine<E> {
         }
 
         self.modules = sorted;
+        Ok(())
+    }
+
+
+    #[inline]
+    fn ensure_not_started(&self) -> EngineResult<()> {
+        if self.started {
+            return Err(EngineError::other("engine already started"));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_module_descriptor(
+        &self,
+        id: &'static str,
+        deps: &'static [&'static str],
+    ) -> EngineResult<()> {
+        if id.trim().is_empty() {
+            return Err(EngineError::other("module id must not be empty"));
+        }
+
+        let mut seen = HashSet::with_capacity(deps.len());
+        for &dep in deps {
+            if dep.trim().is_empty() {
+                return Err(EngineError::other(format!(
+                    "module '{id}' has empty dependency id"
+                )));
+            }
+            if dep == id {
+                return Err(EngineError::other(format!(
+                    "module '{id}' cannot depend on itself"
+                )));
+            }
+            if !seen.insert(dep) {
+                return Err(EngineError::other(format!(
+                    "module '{id}' has duplicate dependency '{dep}'"
+                )));
+            }
+        }
+
         Ok(())
     }
 
