@@ -1,5 +1,5 @@
 use crate::error::{EngineError, EngineResult};
-use crate::startup_config::{
+use crate::startup::{
     ConfigPaths, StartupConfig, StartupConfigSource, StartupDefaults, StartupLoadReport,
     StartupOverride, StartupResolvedFrom, WindowPlacement,
 };
@@ -25,7 +25,6 @@ impl StartupLoader {
             overrides: Vec::new(),
         };
 
-        // Defaults
         cfg.log_level = defaults.log_level.clone();
         cfg.window_title = defaults.window_title.clone();
         cfg.window_size = defaults.window_size;
@@ -33,7 +32,6 @@ impl StartupLoader {
         cfg.modules_dir = defaults.modules_dir.clone();
         cfg.source = StartupConfigSource::Defaults;
 
-        // Optional file
         if let Some(raw_path) = paths.startup_path() {
             match resolve_startup_file_optional(paths, raw_path) {
                 Ok(Some((resolved, from))) => {
@@ -62,7 +60,6 @@ impl StartupLoader {
                     report.source = cfg.source.clone();
                 }
                 Ok(None) => {
-                    // Not found => keep defaults, no overrides, no error.
                     report.source = StartupConfigSource::Defaults;
                     report.file = None;
                     report.resolved_from = StartupResolvedFrom::NotProvided;
@@ -128,7 +125,9 @@ fn apply_root(cfg: &mut StartupConfig, report: &mut StartupLoadReport, src: Root
             apply_size(report, "window_size", &mut cfg.window_size, (ww, hh));
         } else {
             match (w.width, w.height) {
-                (Some(ww), Some(hh)) => apply_size(report, "window_size", &mut cfg.window_size, (ww, hh)),
+                (Some(ww), Some(hh)) => {
+                    apply_size(report, "window_size", &mut cfg.window_size, (ww, hh));
+                }
                 (Some(_), None) | (None, Some(_)) => report.overrides.push(StartupOverride {
                     key: "window_size",
                     from: format_opt_size(cfg.window_size),
@@ -147,7 +146,11 @@ fn apply_root(cfg: &mut StartupConfig, report: &mut StartupLoadReport, src: Root
 }
 
 fn parse_placement(p: WindowPlacementJson) -> Option<WindowPlacement> {
-    let kind = p.kind.unwrap_or_else(|| "default".to_owned()).to_ascii_lowercase();
+    let kind = p
+        .kind
+        .unwrap_or_else(|| "default".to_owned())
+        .to_ascii_lowercase();
+
     match kind.as_str() {
         "centered" => {
             let off = p.offset.unwrap_or([0, 0]);
@@ -196,6 +199,7 @@ fn apply_placement(
         .as_ref()
         .map(format_placement)
         .unwrap_or_else(|| "<unset>".to_owned());
+
     *slot = Some(to.clone());
     report.overrides.push(StartupOverride {
         key,
@@ -206,7 +210,9 @@ fn apply_placement(
 
 fn format_placement(p: &WindowPlacement) -> String {
     match p {
-        WindowPlacement::Centered { offset } => format!("centered(offset={} {})", offset.0, offset.1),
+        WindowPlacement::Centered { offset } => {
+            format!("centered(offset={} {})", offset.0, offset.1)
+        }
         WindowPlacement::Default => "default".to_owned(),
     }
 }
@@ -216,10 +222,6 @@ fn format_opt_size(v: Option<(u32, u32)>) -> String {
         .unwrap_or_else(|| "<unset>".to_owned())
 }
 
-/// Optional resolver:
-/// - returns Ok(Some(...)) when found
-/// - returns Ok(None) when not found
-/// - returns Err only on real unexpected errors
 fn resolve_startup_file_optional(
     paths: &ConfigPaths,
     raw: &Path,

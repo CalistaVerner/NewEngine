@@ -10,8 +10,8 @@ pub mod sched;
 pub mod sync;
 mod system_info;
 pub mod render;
-mod startup_config;
-mod startup_loader;
+
+pub mod startup;
 
 pub use bus::Bus;
 pub use engine::Engine;
@@ -28,6 +28,14 @@ pub use render::{
     RENDER_API_VERSION,
 };
 
-
-pub use startup_config::{ConfigPaths, StartupConfig, StartupConfigSource, StartupDefaults, StartupLoadReport, StartupOverride};
-pub use startup_loader::StartupLoader;
+pub use startup::{
+    ConfigPaths,
+    StartupConfig,
+    StartupConfigSource,
+    StartupDefaults,
+    StartupLoadReport,
+    StartupOverride,
+    StartupResolvedFrom,
+    StartupLoader,
+    WindowPlacement,
+};
