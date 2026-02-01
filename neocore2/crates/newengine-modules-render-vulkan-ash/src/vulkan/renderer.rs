@@ -15,7 +15,7 @@ use super::util::*;
 const FRAMES_IN_FLIGHT: usize = 2;
 
 #[derive(Clone, Copy)]
-struct FrameSync {
+pub(super) struct FrameSync {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
@@ -277,16 +277,19 @@ impl VulkanRenderer {
         self.target_height = height;
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn format(&self) -> vk::Format {
         self.swapchain_format
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn draw_clear(&mut self) -> VkResult<()> {
         self.draw_clear_color([0.10, 0.12, 0.16, 1.0])
