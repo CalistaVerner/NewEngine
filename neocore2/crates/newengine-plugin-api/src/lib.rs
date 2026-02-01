@@ -1,194 +1,71 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(non_local_definitions)]
-#![allow(non_camel_case_types)]
 
-use abi_stable::{
-    library::RootModule,
-    sabi_trait,
-    std_types::{RBox, RResult, RString},
-    sabi_types::VersionStrings,
-    StableAbi,
-};
+use abi_stable::library::RootModule;
+use abi_stable::sabi_trait;
+use abi_stable::sabi_types::VersionStrings;
+use abi_stable::std_types::{RResult, RString, RVec};
+use abi_stable::StableAbi;
 
-
-/* =============================================================================================
-   ABI-safe small structs (no tuples)
-   ============================================================================================= */
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, StableAbi)]
-pub struct Vec2fAbi {
-    pub x: f32,
-    pub y: f32,
-}
-
-impl Vec2fAbi {
-    #[inline]
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi)]
-pub struct Vec2uAbi {
-    pub x: u32,
-    pub y: u32,
-}
-
-impl Vec2uAbi {
-    #[inline]
-    pub const fn new(x: u32, y: u32) -> Self {
-        Self { x, y }
-    }
-}
+pub type Blob = RVec<u8>;
+pub type CapabilityId = RString;
+pub type MethodName = RString;
 
 /* =============================================================================================
-   ABI-safe input / window event types
-   ============================================================================================= */
-
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi)]
-pub enum KeyCodeAbi {
-    Escape,
-    Enter,
-    Space,
-    Tab,
-    Backspace,
-
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-
-    A, B, C, D, E, F, G, H, I, J, K, L, M,
-    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-
-    Digit0, Digit1, Digit2, Digit3, Digit4,
-    Digit5, Digit6, Digit7, Digit8, Digit9,
-
-    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
-
-    Unknown,
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi)]
-pub enum KeyStateAbi {
-    Pressed,
-    Released,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi)]
-pub enum MouseButtonAbi {
-    Left,
-    Right,
-    Middle,
-    Other(u16),
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, StableAbi)]
-pub enum HostEventAbi {
-    Window(WindowHostEventAbi),
-    Input(InputHostEventAbi),
-    Text(TextHostEventAbi),
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, StableAbi)]
-pub enum WindowHostEventAbi {
-    Ready { size: Vec2uAbi },
-    Resized { size: Vec2uAbi },
-    Focused(bool),
-    CloseRequested,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, StableAbi)]
-pub enum InputHostEventAbi {
-    Key {
-        code: KeyCodeAbi,
-        state: KeyStateAbi,
-        repeat: bool,
-    },
-    MouseMove { pos: Vec2fAbi },
-    MouseDelta { delta: Vec2fAbi },
-    MouseButton {
-        button: MouseButtonAbi,
-        state: KeyStateAbi,
-    },
-    MouseWheel { delta: Vec2fAbi },
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, StableAbi)]
-pub enum TextHostEventAbi {
-    /// Unicode scalar value (0..=0x10FFFF). Avoids `char` which is not `StableAbi`.
-    CharU32(u32),
-    ImePreedit(RString),
-    ImeCommit(RString),
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, StableAbi)]
-pub struct PluginInfo {
-    pub id: RString,
-    pub version: RString,
-}
-
-/* =============================================================================================
-   ABI traits
+   Generic service: semantics fully owned by provider plugin
    ============================================================================================= */
 
 #[sabi_trait]
-pub trait HostEventSink: Send {
-    fn on_host_event(&mut self, ev: HostEventAbi);
+pub trait ServiceV1: Send + Sync {
+    fn id(&self) -> CapabilityId;
+    fn describe(&self) -> RString;
+    fn call(&self, method: MethodName, payload: Blob) -> RResult<Blob, RString>;
 }
 
-pub type HostEventSinkDyn<'a> = HostEventSink_TO<'a, RBox<()>>;
+pub type ServiceV1Dyn<'a> = ServiceV1_TO<'a, abi_stable::std_types::RBox<()>>;
 
 #[sabi_trait]
-pub trait InputApiV1: Send + Sync {
-    fn key_down(&self, key: KeyCodeAbi) -> bool;
-    fn key_pressed(&self, key: KeyCodeAbi) -> bool;
-    fn key_released(&self, key: KeyCodeAbi) -> bool;
-
-    fn mouse_pos(&self) -> Vec2fAbi;
-    fn mouse_delta(&self) -> Vec2fAbi;
-    fn wheel_delta(&self) -> Vec2fAbi;
-
-    fn mouse_down(&self, btn: MouseButtonAbi) -> bool;
-    fn mouse_pressed(&self, btn: MouseButtonAbi) -> bool;
-    fn mouse_released(&self, btn: MouseButtonAbi) -> bool;
-
-    fn text_take(&self) -> RString;
-    fn ime_preedit(&self) -> RString;
-    fn ime_commit_take(&self) -> RString;
+pub trait EventSinkV1: Send + Sync {
+    fn on_event(&mut self, topic: RString, payload: Blob);
 }
 
-pub type InputApiV1Dyn<'a> = InputApiV1_TO<'a, RBox<()>>;
+pub type EventSinkV1Dyn<'a> = EventSinkV1_TO<'a, abi_stable::std_types::RBox<()>>;
+
+/* =============================================================================================
+   Host API: pure bridge
+   ============================================================================================= */
 
 #[repr(C)]
-#[derive(abi_stable::StableAbi, Clone)]
+#[derive(Clone, StableAbi)]
 pub struct HostApiV1 {
     pub log_info: extern "C" fn(RString),
     pub log_warn: extern "C" fn(RString),
     pub log_error: extern "C" fn(RString),
 
-    pub request_exit: extern "C" fn(),
-    pub monotonic_time_ns: extern "C" fn() -> u64,
+    pub register_service_v1: extern "C" fn(ServiceV1Dyn<'static>) -> RResult<(), RString>,
 
-    pub subscribe_host_events:
-        extern "C" fn(HostEventSinkDyn<'static>) -> RResult<(), RString>,
+    /// Call an already registered service by id.
+    /// This avoids returning service objects across ABI and avoids Clone requirements.
+    pub call_service_v1: extern "C" fn(CapabilityId, MethodName, Blob) -> RResult<Blob, RString>,
 
-    pub provide_input_api_v1:
-        extern "C" fn(InputApiV1Dyn<'static>) -> RResult<(), RString>,
+    pub emit_event_v1: extern "C" fn(RString, Blob) -> RResult<(), RString>,
+    pub subscribe_events_v1: extern "C" fn(EventSinkV1Dyn<'static>) -> RResult<(), RString>,
+}
+
+/* =============================================================================================
+   Plugin module ABI
+   ============================================================================================= */
+
+#[repr(C)]
+#[derive(Debug, Clone, StableAbi)]
+pub struct PluginInfo {
+    pub id: RString,
+    pub name: RString,
+    pub version: RString,
 }
 
 #[sabi_trait]
-pub trait PluginModule: Send {
+pub trait PluginModule: Send + Sync {
     fn info(&self) -> PluginInfo;
 
     fn init(&mut self, host: HostApiV1) -> RResult<(), RString>;
@@ -201,29 +78,26 @@ pub trait PluginModule: Send {
     fn shutdown(&mut self);
 }
 
-pub type PluginModuleDyn<'a> = PluginModule_TO<'a, RBox<()>>;
+pub type PluginModuleDyn<'a> = PluginModule_TO<'a, abi_stable::std_types::RBox<()>>;
 
 /* =============================================================================================
-   RootModule prefix (creates PluginRootV1_Ref + load_from_file)
-   ============================================================================================= */
-
-/* =============================================================================================
-   RootModule prefix (creates PluginRootV1_Ref + load_from_file)
+   Root module ABI
    ============================================================================================= */
 
 #[repr(C)]
 #[derive(StableAbi)]
-#[allow(non_camel_case_types)]
-#[sabi(kind(Prefix(prefix_ref = PluginRootV1_Ref)))]
+#[sabi(kind(Prefix(prefix_ref = PluginRootV1Ref)))]
 pub struct PluginRootV1 {
+    /// Mark as the stable prefix boundary so older/newer binaries remain compatible
+    /// when you add new optional fields later.
     #[sabi(last_prefix_field)]
     pub create: extern "C" fn() -> PluginModuleDyn<'static>,
 }
 
-impl RootModule for PluginRootV1_Ref {
-    abi_stable::declare_root_module_statics! { PluginRootV1_Ref }
+impl RootModule for PluginRootV1Ref {
+    abi_stable::declare_root_module_statics! { PluginRootV1Ref }
 
-    const BASE_NAME: &'static str = "newengine_plugin";
-    const NAME: &'static str = "newengine_plugin";
+    const BASE_NAME: &'static str = "export_plugin_root";
+    const NAME: &'static str = "export_plugin_root";
     const VERSION_STRINGS: VersionStrings = abi_stable::package_version_strings!();
 }
