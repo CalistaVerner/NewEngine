@@ -161,9 +161,9 @@ impl Default for SamplerDesc {
             min_filter: FilterMode::Linear,
             mag_filter: FilterMode::Linear,
             mip_filter: FilterMode::Linear,
-            address_u: AddressMode::ClampToEdge,
-            address_v: AddressMode::ClampToEdge,
-            address_w: AddressMode::ClampToEdge,
+            address_u: AddressMode::Repeat,
+            address_v: AddressMode::Repeat,
+            address_w: AddressMode::Repeat,
         }
     }
 }
@@ -366,13 +366,6 @@ pub struct ShaderId(NonZeroU32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineId(NonZeroU32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BindGroupLayoutId(NonZeroU32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BindGroupId(NonZeroU32);
-
-#[allow(dead_code)]
 impl BufferId {
     #[inline]
     pub(crate) fn new(v: u32) -> Self {
@@ -380,7 +373,6 @@ impl BufferId {
     }
 }
 
-#[allow(dead_code)]
 impl TextureId {
     #[inline]
     pub(crate) fn new(v: u32) -> Self {
@@ -388,7 +380,6 @@ impl TextureId {
     }
 }
 
-#[allow(dead_code)]
 impl SamplerId {
     #[inline]
     pub(crate) fn new(v: u32) -> Self {
@@ -396,7 +387,6 @@ impl SamplerId {
     }
 }
 
-#[allow(dead_code)]
 impl ShaderId {
     #[inline]
     pub(crate) fn new(v: u32) -> Self {
@@ -404,27 +394,10 @@ impl ShaderId {
     }
 }
 
-#[allow(dead_code)]
 impl PipelineId {
     #[inline]
     pub(crate) fn new(v: u32) -> Self {
         Self(NonZeroU32::new(v).expect("PipelineId must be non-zero"))
-    }
-}
-
-#[allow(dead_code)]
-impl BindGroupLayoutId {
-    #[inline]
-    pub(crate) fn new(v: u32) -> Self {
-        Self(NonZeroU32::new(v).expect("BindGroupLayoutId must be non-zero"))
-    }
-}
-
-#[allow(dead_code)]
-impl BindGroupId {
-    #[inline]
-    pub(crate) fn new(v: u32) -> Self {
-        Self(NonZeroU32::new(v).expect("BindGroupId must be non-zero"))
     }
 }
 
@@ -483,72 +456,9 @@ impl DrawIndexedArgs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingKind {
-    Texture2D,
-    Sampler,
-}
-
-#[derive(Debug, Clone)]
-pub struct BindGroupLayoutDesc {
-    pub label: Option<&'static str>,
-    pub bindings: Vec<BindingKind>,
-}
-
-impl BindGroupLayoutDesc {
-    #[inline]
-    pub fn new(bindings: Vec<BindingKind>) -> Self {
-        Self {
-            label: None,
-            bindings,
-        }
-    }
-
-    #[inline]
-    pub fn with_label(mut self, label: &'static str) -> Self {
-        self.label = Some(label);
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BindGroupDesc {
-    pub label: Option<&'static str>,
-    pub layout: BindGroupLayoutId,
-    pub texture0: Option<TextureId>,
-    pub sampler0: Option<SamplerId>,
-}
-
-impl BindGroupDesc {
-    #[inline]
-    pub fn new(layout: BindGroupLayoutId) -> Self {
-        Self {
-            label: None,
-            layout,
-            texture0: None,
-            sampler0: None,
-        }
-    }
-
-    #[inline]
-    pub fn with_label(mut self, label: &'static str) -> Self {
-        self.label = Some(label);
-        self
-    }
-
-    #[inline]
-    pub fn with_texture0(mut self, tex: TextureId) -> Self {
-        self.texture0 = Some(tex);
-        self
-    }
-
-    #[inline]
-    pub fn with_sampler0(mut self, s: SamplerId) -> Self {
-        self.sampler0 = Some(s);
-        self
-    }
-}
-
+/// Render backend contract.
+///
+/// Object-safe, used through Arc<Mutex<...>>. Commands are recorded between begin_frame/end_frame.
 pub trait RenderApi: Send {
     fn begin_frame(&mut self, desc: BeginFrameDesc) -> EngineResult<()>;
     fn end_frame(&mut self) -> EngineResult<()>;
@@ -556,6 +466,7 @@ pub trait RenderApi: Send {
 
     fn create_buffer(&mut self, desc: BufferDesc) -> EngineResult<BufferId>;
     fn destroy_buffer(&mut self, id: BufferId);
+
     fn write_buffer(&mut self, id: BufferId, offset: u64, data: &[u8]) -> EngineResult<()>;
 
     fn create_texture(&mut self, desc: TextureDesc) -> EngineResult<TextureId>;
@@ -570,18 +481,10 @@ pub trait RenderApi: Send {
     fn create_pipeline(&mut self, desc: PipelineDesc) -> EngineResult<PipelineId>;
     fn destroy_pipeline(&mut self, id: PipelineId);
 
-    fn create_bind_group_layout(&mut self, desc: BindGroupLayoutDesc) -> EngineResult<BindGroupLayoutId>;
-    fn destroy_bind_group_layout(&mut self, id: BindGroupLayoutId);
-
-    fn create_bind_group(&mut self, desc: BindGroupDesc) -> EngineResult<BindGroupId>;
-    fn destroy_bind_group(&mut self, id: BindGroupId);
-
     fn set_viewport(&mut self, vp: Viewport) -> EngineResult<()>;
     fn set_scissor(&mut self, rect: RectI32) -> EngineResult<()>;
 
     fn set_pipeline(&mut self, pipeline: PipelineId) -> EngineResult<()>;
-    fn set_bind_group(&mut self, index: u32, group: BindGroupId) -> EngineResult<()>;
-
     fn set_vertex_buffer(&mut self, slot: u32, slice: BufferSlice) -> EngineResult<()>;
     fn set_index_buffer(&mut self, slice: BufferSlice, format: IndexFormat) -> EngineResult<()>;
 

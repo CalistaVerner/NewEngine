@@ -2,7 +2,7 @@ use crate::error::{EngineError, EngineResult, ModuleStage};
 use crate::events::EventHub;
 use crate::frame::Frame;
 use crate::module::{ApiVersion, Bus, Module, ModuleCtx, Resources, Services};
-use crate::plugins::{default_host_api, PluginManager};
+use crate::plugins::{PluginManager, default_host_api};
 use crate::sched::Scheduler;
 use crate::sync::ShutdownToken;
 use crate::system_info::SystemInfo;
@@ -99,13 +99,24 @@ impl<E: Send + 'static> Engine<E> {
     ) -> EngineResult<Self> {
         let fixed_dt = (fixed_dt_ms as f32 / 1000.0).max(0.001);
 
+        let mut resources = Resources::default();
+
+        let assets_root = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("assets");
+
+        let mut asset_manager = crate::assets::AssetManager::new_default(assets_root);
+        asset_manager.set_budget(8);
+
+        resources.insert(asset_manager);
+
         Ok(Self {
             fixed_dt,
             services,
             modules: Vec::new(),
             module_ids: HashSet::new(),
 
-            resources: Resources::default(),
+            resources,
             bus,
             events: EventHub::new(),
             scheduler: Scheduler::new(),
@@ -123,6 +134,8 @@ impl<E: Send + 'static> Engine<E> {
             acc: 0.0,
         })
     }
+
+
 
     #[inline]
     pub fn resources_mut(&mut self) -> &mut Resources {
@@ -193,9 +206,14 @@ impl<E: Send + 'static> Engine<E> {
         let host = default_host_api();
 
         if let Err(e) = self.plugins.load_default(host) {
-            return Err(Self::phase_err(phase, Self::elapsed_since(t0), e));
+            log::warn!(
+                "plugins: non-fatal load error (phase={} {}): {}",
+                phase,
+                Self::elapsed_since(t0),
+                e
+            );
+            // do not fail engine startup
         }
-
         self.plugins_loaded = true;
 
         let loaded = self.plugins.iter().count();
@@ -515,6 +533,9 @@ impl<E: Send + 'static> Engine<E> {
 
         self.scheduler.end_frame(Duration::from_secs_f32(dt));
         self.frame_index = self.frame_index.wrapping_add(1);
+        if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
+            am.pump();
+        }
 
         Ok(frame)
     }

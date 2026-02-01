@@ -10,8 +10,10 @@ pub mod sched;
 pub mod sync;
 mod system_info;
 pub mod render;
-
 pub mod startup;
+pub mod assets;
+pub use assets::AssetManager;
+
 
 pub use bus::Bus;
 pub use engine::Engine;

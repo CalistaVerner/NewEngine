@@ -1,18 +1,25 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use abi_stable::library::RootModule;
-use abi_stable::std_types::RString;
+use abi_stable::std_types::{RResult, RString};
+use libloading::Library;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Instant;
 
-use newengine_plugin_api::{HostApiV1, PluginInfo, PluginModule_TO, PluginRootV1_Ref};
+use newengine_plugin_api::{
+    Blob, CapabilityId, EventSinkV1Dyn, HostApiV1, MethodName, PluginInfo, PluginModuleDyn,
+    PluginRootV1Ref, ServiceV1Dyn,
+};
 
-use crate::sync::ShutdownToken;
+/* =============================================================================================
+   Plugin manager
+   ============================================================================================= */
 
 pub struct LoadedPlugin {
     _path: PathBuf,
-    module: PluginModule_TO<'static, abi_stable::std_types::RBox<()>>,
+    _lib: Library,
+    _root: PluginRootV1Ref,
+    module: PluginModuleDyn<'static>,
     info: PluginInfo,
 }
 
@@ -26,6 +33,7 @@ impl LoadedPlugin {
 pub struct PluginManager {
     plugins: Vec<LoadedPlugin>,
     started: bool,
+    ids: HashSet<String>,
 }
 
 impl PluginManager {
@@ -34,6 +42,7 @@ impl PluginManager {
         Self {
             plugins: Vec::new(),
             started: false,
+            ids: HashSet::new(),
         }
     }
 
@@ -53,16 +62,8 @@ impl PluginManager {
             dir.display()
         )));
 
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            (host.log_error)(RString::from(format!(
-                "plugins: create_dir_all('{}') failed: {e}",
-                dir.display()
-            )));
-            return Err(format!(
-                "plugins: create_dir_all('{}') failed: {e}",
-                dir.display()
-            ));
-        }
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("plugins: create_dir_all('{}') failed: {e}", dir.display()))?;
 
         let mut libs: Vec<PathBuf> = Vec::new();
         let rd = std::fs::read_dir(dir)
@@ -84,43 +85,57 @@ impl PluginManager {
             dir.display()
         )));
 
+        let mut loaded = 0usize;
+        let mut skipped = 0usize;
+
         for path in libs {
             (host.log_info)(RString::from(format!(
                 "plugins: loading '{}'",
                 path.display()
             )));
 
-            let root = match PluginRootV1_Ref::load_from_file(&path) {
-                Ok(r) => r,
+            let (lib, root) = match load_root_via_libloading(&path) {
+                Ok(v) => v,
                 Err(e) => {
-                    (host.log_error)(RString::from(format!(
-                        "plugins: load_from_file('{}') failed: {e}",
-                        path.display()
+                    skipped += 1;
+                    (host.log_warn)(RString::from(format!(
+                        "plugins: SKIP incompatible plugin file='{}': {}",
+                        path.display(),
+                        e
                     )));
-                    return Err(format!(
-                        "plugins: load_from_file('{}') failed: {e}",
-                        path.display()
-                    ));
+                    continue;
                 }
             };
 
-            let mut module = (root.create())();
+            let mut module = root.create()();
             let info = module.info();
 
+            let id_key = info.id.to_string();
+            if self.ids.contains(&id_key) {
+                skipped += 1;
+                (host.log_warn)(RString::from(format!(
+                    "plugins: SKIP duplicate plugin id='{}' file='{}'",
+                    info.id,
+                    path.display()
+                )));
+                continue;
+            }
+
             if let Err(e) = module.init(host.clone()).into_result() {
-                (host.log_error)(RString::from(format!(
-                    "plugins: init failed for id='{}' ver='{}' file='{}': {}",
+                skipped += 1;
+                (host.log_warn)(RString::from(format!(
+                    "plugins: SKIP plugin init failed id='{}' ver='{}' file='{}': {}",
                     info.id,
                     info.version,
                     path.display(),
                     e
                 )));
-                return Err(format!(
-                    "plugins: init failed for id='{}' ver='{}': {}",
-                    info.id, info.version, e
-                ));
+                continue;
             }
 
+            self.ids.insert(id_key);
+
+            loaded += 1;
             (host.log_info)(RString::from(format!(
                 "plugins: loaded id='{}' ver='{}' from '{}'",
                 info.id,
@@ -130,10 +145,17 @@ impl PluginManager {
 
             self.plugins.push(LoadedPlugin {
                 _path: path,
+                _lib: lib,
+                _root: root,
                 module,
                 info,
             });
         }
+
+        (host.log_info)(RString::from(format!(
+            "plugins: load summary loaded={} skipped={}",
+            loaded, skipped
+        )));
 
         Ok(())
     }
@@ -188,9 +210,64 @@ impl PluginManager {
             p.module.shutdown();
         }
         self.plugins.clear();
+        self.ids.clear();
         self.started = false;
     }
 }
+
+/* =============================================================================================
+   Root loading bound to a specific DLL (no global cache)
+   ============================================================================================= */
+
+fn load_root_via_libloading(path: &Path) -> Result<(Library, PluginRootV1Ref), String> {
+    let lib = unsafe {
+        Library::new(path)
+            .map_err(|e| format!("load library failed file='{}': {e}", path.display()))?
+    };
+
+    let name_primary = <PluginRootV1Ref as RootModule>::NAME;
+    let name_fallback = <PluginRootV1Ref as RootModule>::BASE_NAME;
+
+    // Safety: we resolve function pointers from a live library handle and call them immediately.
+    unsafe {
+        if let Ok(root) = try_get_root_fn(&lib, name_primary) {
+            return Ok((lib, root));
+        }
+        if let Ok(root) = try_get_root_fn(&lib, name_fallback) {
+            return Ok((lib, root));
+        }
+    }
+
+    Err(format!(
+        "missing root symbol '{}' (or '{}') in '{}': GetProcAddress failed",
+        name_primary,
+        name_fallback,
+        path.display()
+    ))
+}
+
+unsafe fn try_get_root_fn(lib: &Library, sym_name: &str) -> Result<PluginRootV1Ref, ()> {
+    let mut bytes = Vec::with_capacity(sym_name.len() + 1);
+    bytes.extend_from_slice(sym_name.as_bytes());
+    bytes.push(0);
+
+    let sym = unsafe {
+        lib.get::<unsafe extern "C" fn() -> PluginRootV1Ref>(&bytes)
+            .map_err(|_| ())?
+    };
+
+    let get_root: unsafe extern "C" fn() -> PluginRootV1Ref = *sym;
+
+    // End the borrow of `lib` before calling/returning anything.
+    drop(sym);
+
+    let root = unsafe { get_root() };
+    Ok(root)
+}
+
+/* =============================================================================================
+   Helpers
+   ============================================================================================= */
 
 #[inline]
 fn is_dynlib(p: &Path) -> bool {
@@ -200,38 +277,55 @@ fn is_dynlib(p: &Path) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "dll" | "so" | "dylib")
 }
 
-pub fn modules_dir_near_exe() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let base = exe
-        .parent()
-        .ok_or_else(|| "current_exe has no parent directory".to_string())?;
-    Ok(base.join("modules"))
-}
-
+#[inline]
 pub fn default_host_api() -> HostApiV1 {
     extern "C" fn log_info(msg: RString) {
         log::info!("{}", msg);
     }
+
     extern "C" fn log_warn(msg: RString) {
         log::warn!("{}", msg);
     }
+
     extern "C" fn log_error(msg: RString) {
         log::error!("{}", msg);
     }
-    extern "C" fn request_exit() {
-        ShutdownToken::global_request();
+
+    extern "C" fn register_service_v1(_svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
+        RResult::ROk(())
     }
-    extern "C" fn monotonic_time_ns() -> u64 {
-        static START: OnceLock<Instant> = OnceLock::new();
-        let start = *START.get_or_init(Instant::now);
-        start.elapsed().as_nanos() as u64
+
+    extern "C" fn call_service_v1(
+        _id: CapabilityId,
+        _method: MethodName,
+        _payload: Blob,
+    ) -> RResult<Blob, RString> {
+        RResult::RErr(RString::from("service not found"))
+    }
+
+    extern "C" fn emit_event_v1(_topic: RString, _payload: Blob) -> RResult<(), RString> {
+        RResult::ROk(())
+    }
+
+    extern "C" fn subscribe_events_v1(_sink: EventSinkV1Dyn<'static>) -> RResult<(), RString> {
+        RResult::ROk(())
     }
 
     HostApiV1 {
         log_info,
         log_warn,
         log_error,
-        request_exit,
-        monotonic_time_ns,
+        register_service_v1,
+        call_service_v1,
+        emit_event_v1,
+        subscribe_events_v1,
     }
+}
+
+pub fn modules_dir_near_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let base = exe
+        .parent()
+        .ok_or_else(|| "current_exe has no parent directory".to_string())?;
+    Ok(base.to_path_buf())
 }
