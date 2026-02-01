@@ -1,9 +1,7 @@
 use crate::id::AssetId;
-use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-/// Asset lookup key: (logical path + import settings hash).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetKey {
     pub logical_path: PathBuf,
@@ -13,8 +11,10 @@ pub struct AssetKey {
 impl AssetKey {
     #[inline]
     pub fn new(logical_path: impl Into<PathBuf>, settings_hash: u64) -> Self {
+        let mut p = logical_path.into();
+        p = normalize_logical_path(&p);
         Self {
-            logical_path: logical_path.into(),
+            logical_path: p,
             settings_hash,
         }
     }
@@ -25,36 +25,28 @@ impl AssetKey {
     }
 }
 
-/// Strongly-typed handle used by game code/systems.
-/// The handle is stable and can be stored inside ECS/resources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Handle<T: Asset> {
-    id: AssetId,
-    _pd: PhantomData<fn() -> T>,
-}
-
-impl<T: Asset> Handle<T> {
-    #[inline]
-    pub fn id(self) -> AssetId {
-        self.id
-    }
-
-    #[inline]
-    pub(crate) fn new(id: AssetId) -> Self {
-        Self {
-            id,
-            _pd: PhantomData,
-        }
-    }
-}
-
-/// Base asset marker trait (CPU-side).
+/// Marker trait for typed, CPU-side assets (optional layer).
 pub trait Asset: Send + Sync + 'static {
     fn type_name() -> &'static str;
 }
 
-/// Shared reference to a loaded asset instance.
-pub type AssetRef<T> = Arc<T>;
+/// Opaque asset payload produced by importers (including plugin importers).
+#[derive(Debug, Clone)]
+pub struct AssetBlob {
+    pub type_id: Arc<str>,
+    pub format: Arc<str>,
+    pub payload: Vec<u8>,
+    pub meta_json: Arc<str>,
+    pub dependencies: Vec<AssetDependency>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetDependency {
+    pub logical_path: PathBuf,
+    pub settings_hash: u64,
+    pub type_hint: Arc<str>,
+    pub usage: Arc<str>,
+}
 
 #[derive(Debug, Clone)]
 pub enum AssetState {
@@ -64,7 +56,6 @@ pub enum AssetState {
     Failed(Arc<str>),
 }
 
-/// Minimal error type for import/load pipeline.
 #[derive(Debug, Clone)]
 pub struct AssetError {
     msg: Arc<str>,
@@ -89,3 +80,40 @@ impl std::fmt::Display for AssetError {
 }
 
 impl std::error::Error for AssetError {}
+
+/// Importer priority (host-defined). Higher wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImporterPriority(pub i32);
+
+impl ImporterPriority {
+    #[inline]
+    pub const fn new(v: i32) -> Self {
+        Self(v)
+    }
+}
+
+#[inline]
+fn normalize_logical_path(p: &Path) -> PathBuf {
+    // Logical path contract:
+    // - relative
+    // - no root prefix
+    // - no '.' or '..' escapes
+    // - forward-slash equivalent via components joining
+    let mut out = PathBuf::new();
+
+    for c in p.components() {
+        match c {
+            Component::Normal(x) => out.push(x),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // refuse path traversal: drop parent dirs deterministically
+                // (host can choose to error earlier if desired)
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                // strip absolute prefixes for logical path stability
+            }
+        }
+    }
+
+    out
+}

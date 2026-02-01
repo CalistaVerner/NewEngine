@@ -1,14 +1,11 @@
 use crate::types::AssetError;
 use std::path::{Path, PathBuf};
 
-/// Source of raw bytes for assets.
 pub trait AssetSource: Send + Sync + 'static {
     fn exists(&self, logical_path: &Path) -> bool;
     fn read(&self, logical_path: &Path) -> Result<Vec<u8>, AssetError>;
 }
 
-/// Filesystem-backed source rooted at a directory.
-/// `logical_path` is joined to `root` without normalization side effects.
 #[derive(Debug, Clone)]
 pub struct FileSystemSource {
     root: PathBuf,
@@ -18,11 +15,6 @@ impl FileSystemSource {
     #[inline]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
-    }
-
-    #[inline]
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     #[inline]

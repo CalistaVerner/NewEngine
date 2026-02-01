@@ -1,9 +1,8 @@
-use crate::types::AssetKey;
 use blake3::Hasher;
-use std::hash::Hash;
 use std::path::Path;
 
-/// Stable asset identifier (content-addressed by key, not by runtime pointer).
+use crate::types::AssetKey;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct AssetId(pub(crate) u128);
@@ -17,8 +16,9 @@ impl AssetId {
     #[inline]
     pub fn from_key(key: &AssetKey) -> Self {
         let mut h = Hasher::new();
-        hash_path(&mut h, &key.logical_path);
+        hash_logical_path(&mut h, &key.logical_path);
         h.update(&key.settings_hash.to_le_bytes());
+
         let out = h.finalize();
         let bytes = out.as_bytes();
         let mut lo = [0u8; 16];
@@ -28,9 +28,23 @@ impl AssetId {
 }
 
 #[inline]
-fn hash_path(h: &mut Hasher, p: &Path) {
-    // We hash the normalized string representation to keep behavior stable.
-    // This remains deterministic for the same logical path inside the project.
-    let s = p.to_string_lossy();
-    h.update(s.as_bytes());
+fn hash_logical_path(h: &mut Hasher, p: &Path) {
+    // Stable across platforms:
+    // - components joined with '/'
+    // - ascii-lower for deterministic extension/path matching on Windows-like FS
+    //   (logical paths should be authored consistently anyway)
+    let mut first = true;
+    for comp in p.components() {
+        let s = comp.as_os_str().to_string_lossy();
+        if s.is_empty() {
+            continue;
+        }
+        if !first {
+            h.update(b"/");
+        }
+        first = false;
+        // Avoid locale issues; keep simple deterministic normalization
+        let lower = s.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect::<Vec<u8>>();
+        h.update(&lower);
+    }
 }

@@ -5,11 +5,12 @@ use std::sync::Arc;
 pub enum AssetEvent {
     Ready {
         id: AssetId,
-        type_name: &'static str,
+        type_id: Arc<str>,
+        format: Arc<str>,
     },
     Failed {
         id: AssetId,
-        type_name: &'static str,
+        type_id: Arc<str>,
         error: Arc<str>,
     },
 }
