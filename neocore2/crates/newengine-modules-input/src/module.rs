@@ -1,96 +1,426 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use abi_stable::sabi_trait::TD_Opaque;
-use abi_stable::std_types::{RResult, RString};
+use abi_stable::std_types::{RResult, RString, RVec};
 use abi_stable::StableAbi;
 
 use newengine_plugin_api::{
-    HostApiV1, HostEventAbi, HostEventSink, HostEventSinkDyn, HostEventSink_TO, InputApiV1,
-    InputApiV1Dyn, InputApiV1_TO, InputHostEventAbi, KeyCodeAbi, KeyStateAbi, MouseButtonAbi,
-    PluginInfo, PluginModule, TextHostEventAbi, Vec2fAbi,
+    Blob, EventSinkV1, EventSinkV1Dyn, EventSinkV1_TO, HostApiV1, MethodName, PluginInfo,
+    PluginModule, ServiceV1, ServiceV1Dyn, ServiceV1_TO,
 };
 
-use std::sync::{Mutex, OnceLock};
+use gilrs::{EventType, Gilrs};
+use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
-struct State {
-    keys_down: [bool; 256],
-    keys_pressed: [bool; 256],
-    keys_released: [bool; 256],
+/* =============================================================================================
+   Internal state (plugin-owned schema)
+   ============================================================================================= */
 
-    mouse_pos: Vec2fAbi,
-    mouse_delta: Vec2fAbi,
-    wheel_delta: Vec2fAbi,
+#[derive(Default)]
+struct KeyState {
+    down: BTreeSet<u32>,
+    pressed: BTreeSet<u32>,
+    released: BTreeSet<u32>,
+}
 
-    mouse_down_bits: u32,
-    mouse_pressed_bits: u32,
-    mouse_released_bits: u32,
+#[derive(Default)]
+struct MouseState {
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+    wheel_x: f32,
+    wheel_y: f32,
+    down: BTreeSet<u32>,
+    pressed: BTreeSet<u32>,
+    released: BTreeSet<u32>,
+}
 
+#[derive(Default)]
+struct TextState {
     text: String,
     ime_preedit: String,
     ime_commit: String,
 }
 
-impl Default for State {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            keys_down: [false; 256],
-            keys_pressed: [false; 256],
-            keys_released: [false; 256],
+#[derive(Default)]
+struct GamepadState {
+    connected: bool,
+    buttons: BTreeMap<String, f32>,
+    axes: BTreeMap<String, f32>,
+}
 
-            mouse_pos: Vec2fAbi::new(0.0, 0.0),
-            mouse_delta: Vec2fAbi::new(0.0, 0.0),
-            wheel_delta: Vec2fAbi::new(0.0, 0.0),
-
-            mouse_down_bits: 0,
-            mouse_pressed_bits: 0,
-            mouse_released_bits: 0,
-
-            text: String::new(),
-            ime_preedit: String::new(),
-            ime_commit: String::new(),
-        }
-    }
+#[derive(Default)]
+struct State {
+    keys: KeyState,
+    mouse: MouseState,
+    text: TextState,
+    gamepads: BTreeMap<String, GamepadState>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
-#[inline(always)]
-fn state_opt() -> Option<&'static Mutex<State>> {
-    STATE.get()
+#[inline]
+fn state() -> &'static Mutex<State> {
+    STATE.get_or_init(|| Mutex::new(State::default()))
 }
 
-#[inline(always)]
-fn key_idx(k: KeyCodeAbi) -> usize {
-    (k as usize).min(255)
+/* =============================================================================================
+   Incoming event JSON (sent by host/platform plugin)
+   ============================================================================================= */
+
+#[derive(Debug, Deserialize)]
+struct KeyEventJson {
+    key: u32,
+    #[serde(default)]
+    scancode: u32,
+    state: String,
+    #[serde(default)]
+    repeat: bool,
 }
 
-#[inline(always)]
-fn mouse_bit(b: MouseButtonAbi) -> u32 {
-    match b {
-        MouseButtonAbi::Left => 1 << 0,
-        MouseButtonAbi::Right => 1 << 1,
-        MouseButtonAbi::Middle => 1 << 2,
-        MouseButtonAbi::Other(n) => {
-            let v = (n as u32).min(28);
-            1 << (3 + v)
+#[derive(Debug, Deserialize)]
+struct MouseMoveJson {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct MouseDeltaJson {
+    dx: f32,
+    dy: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct MouseWheelJson {
+    dx: f32,
+    dy: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct MouseButtonJson {
+    button: u32,
+    state: String,
+}
+
+/* =============================================================================================
+   Event sink
+   ============================================================================================= */
+
+#[derive(StableAbi)]
+#[repr(C)]
+struct InputEventSink;
+
+impl EventSinkV1 for InputEventSink {
+    fn on_event(&mut self, topic: RString, payload: Blob) {
+        let topic = topic.as_str();
+        let bytes: Vec<u8> = payload.into_vec();
+
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return;
+        };
+
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+
+        match topic {
+            "winit.key" => {
+                let Ok(ev) = serde_json::from_value::<KeyEventJson>(v) else {
+                    return;
+                };
+
+                let mut g = state().lock();
+                let was_down = g.keys.down.contains(&ev.key);
+                let is_down = ev.state.eq_ignore_ascii_case("pressed");
+
+                if is_down {
+                    g.keys.down.insert(ev.key);
+                } else {
+                    g.keys.down.remove(&ev.key);
+                }
+
+                if !ev.repeat {
+                    if is_down && !was_down {
+                        g.keys.pressed.insert(ev.key);
+                    }
+                    if !is_down && was_down {
+                        g.keys.released.insert(ev.key);
+                    }
+                }
+            }
+
+            "winit.mouse_move" => {
+                let Ok(ev) = serde_json::from_value::<MouseMoveJson>(v) else {
+                    return;
+                };
+                let mut g = state().lock();
+                g.mouse.x = ev.x;
+                g.mouse.y = ev.y;
+            }
+
+            "winit.mouse_delta" => {
+                let Ok(ev) = serde_json::from_value::<MouseDeltaJson>(v) else {
+                    return;
+                };
+                let mut g = state().lock();
+                g.mouse.dx += ev.dx;
+                g.mouse.dy += ev.dy;
+            }
+
+            "winit.mouse_wheel" => {
+                let Ok(ev) = serde_json::from_value::<MouseWheelJson>(v) else {
+                    return;
+                };
+                let mut g = state().lock();
+                g.mouse.wheel_x += ev.dx;
+                g.mouse.wheel_y += ev.dy;
+            }
+
+            "winit.mouse_button" => {
+                let Ok(ev) = serde_json::from_value::<MouseButtonJson>(v) else {
+                    return;
+                };
+
+                let mut g = state().lock();
+                let was_down = g.mouse.down.contains(&ev.button);
+                let is_down = ev.state.eq_ignore_ascii_case("pressed");
+
+                if is_down {
+                    g.mouse.down.insert(ev.button);
+                } else {
+                    g.mouse.down.remove(&ev.button);
+                }
+
+                if is_down && !was_down {
+                    g.mouse.pressed.insert(ev.button);
+                }
+                if !is_down && was_down {
+                    g.mouse.released.insert(ev.button);
+                }
+            }
+
+            "winit.text_char" => {
+                if let Some(cp) = v.get("cp").and_then(|x| x.as_u64()) {
+                    if let Some(ch) = char::from_u32(cp as u32) {
+                        let mut g = state().lock();
+                        g.text.text.push(ch);
+                    }
+                }
+            }
+
+            "winit.ime_preedit" => {
+                if let Some(s) = v.get("text").and_then(|x| x.as_str()) {
+                    let mut g = state().lock();
+                    g.text.ime_preedit.clear();
+                    g.text.ime_preedit.push_str(s);
+                }
+            }
+
+            "winit.ime_commit" => {
+                if let Some(s) = v.get("text").and_then(|x| x.as_str()) {
+                    let mut g = state().lock();
+                    g.text.ime_commit.clear();
+                    g.text.ime_commit.push_str(s);
+                }
+            }
+
+            _ => {}
         }
     }
 }
 
-#[inline(always)]
-fn ok_unit() -> RResult<(), RString> {
-    RResult::ROk(())
-}
+/* =============================================================================================
+   Service (capability)
+   ============================================================================================= */
 
 #[derive(StableAbi)]
 #[repr(C)]
-pub struct InputPlugin;
+struct InputService;
+
+impl InputService {
+    fn snapshot_json() -> String {
+        let g = state().lock();
+
+        let keys_down: Vec<u32> = g.keys.down.iter().copied().collect();
+        let keys_pressed: Vec<u32> = g.keys.pressed.iter().copied().collect();
+        let keys_released: Vec<u32> = g.keys.released.iter().copied().collect();
+
+        let mouse_down: Vec<u32> = g.mouse.down.iter().copied().collect();
+        let mouse_pressed: Vec<u32> = g.mouse.pressed.iter().copied().collect();
+        let mouse_released: Vec<u32> = g.mouse.released.iter().copied().collect();
+
+        let pads = g
+            .gamepads
+            .iter()
+            .map(|(id, st)| {
+                (
+                    id.clone(),
+                    json!({
+                        "connected": st.connected,
+                        "buttons": st.buttons,
+                        "axes": st.axes,
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        json!({
+            "keys": {
+                "down": keys_down,
+                "pressed": keys_pressed,
+                "released": keys_released,
+            },
+            "mouse": {
+                "pos": { "x": g.mouse.x, "y": g.mouse.y },
+                "delta": { "x": g.mouse.dx, "y": g.mouse.dy },
+                "wheel": { "x": g.mouse.wheel_x, "y": g.mouse.wheel_y },
+                "down": mouse_down,
+                "pressed": mouse_pressed,
+                "released": mouse_released,
+            },
+            "text": {
+                "buffer": g.text.text,
+                "ime_preedit": g.text.ime_preedit,
+                "ime_commit": g.text.ime_commit,
+            },
+            "gamepads": pads
+        })
+            .to_string()
+    }
+
+    fn take_text_json() -> String {
+        let mut g = state().lock();
+        let text = std::mem::take(&mut g.text.text);
+        json!({ "text": text }).to_string()
+    }
+
+    fn take_ime_commit_json() -> String {
+        let mut g = state().lock();
+        let text = std::mem::take(&mut g.text.ime_commit);
+        json!({ "ime_commit": text }).to_string()
+    }
+}
+
+impl ServiceV1 for InputService {
+    fn id(&self) -> RString {
+        RString::from("kalitech.input.v1")
+    }
+
+    fn describe(&self) -> RString {
+        RString::from(
+            r#"{
+  "id":"kalitech.input.v1",
+  "methods":{
+    "state_json":{"in":"{}","out":"input state snapshot as JSON"},
+    "text_take_json":{"in":"{}","out":"{text:string} and clears internal text buffer"},
+    "ime_commit_take_json":{"in":"{}","out":"{ime_commit:string} and clears internal commit buffer"}
+  },
+  "events_expected":{
+    "winit.key":"{key:u32, scancode?:u32, state:'pressed'|'released', repeat?:bool}",
+    "winit.mouse_move":"{x:f32,y:f32}",
+    "winit.mouse_delta":"{dx:f32,dy:f32}",
+    "winit.mouse_button":"{button:u32,state:'pressed'|'released'}",
+    "winit.mouse_wheel":"{dx:f32,dy:f32}",
+    "winit.text_char":"{cp:u32}",
+    "winit.ime_preedit":"{text:string}",
+    "winit.ime_commit":"{text:string}"
+  }
+}"#,
+        )
+    }
+
+    fn call(&self, method: MethodName, _payload: Blob) -> RResult<Blob, RString> {
+        match method.as_str() {
+            "state_json" => RResult::ROk(RVec::from(InputService::snapshot_json().into_bytes())),
+            "text_take_json" => RResult::ROk(RVec::from(InputService::take_text_json().into_bytes())),
+            "ime_commit_take_json" => {
+                RResult::ROk(RVec::from(InputService::take_ime_commit_json().into_bytes()))
+            }
+            _ => RResult::RErr(RString::from(format!(
+                "input: unknown method '{}'",
+                method
+            ))),
+        }
+    }
+}
+
+/* =============================================================================================
+   Plugin module
+   ============================================================================================= */
+
+pub struct InputPlugin {
+    // FIX: Gilrs is not Sync; keep it behind a Mutex so InputPlugin becomes Sync.
+    gilrs: Mutex<Option<Gilrs>>,
+}
 
 impl Default for InputPlugin {
-    #[inline]
     fn default() -> Self {
-        Self
+        let g = Gilrs::new().ok();
+        Self {
+            gilrs: Mutex::new(g),
+        }
+    }
+}
+
+impl InputPlugin {
+    fn poll_gilrs(&self) {
+        let mut lock = self.gilrs.lock();
+        let Some(gilrs) = lock.as_mut() else { return; };
+
+        while let Some(ev) = gilrs.next_event() {
+            let id = format!("{:?}", ev.id);
+
+            let mut g = state().lock();
+            let st = g.gamepads.entry(id).or_default();
+
+            match ev.event {
+                EventType::Connected => {
+                    st.connected = true;
+                }
+                EventType::Disconnected => {
+                    st.connected = false;
+                }
+
+                EventType::ButtonPressed(b, _) => {
+                    st.buttons.insert(format!("{:?}", b), 1.0);
+                }
+                EventType::ButtonReleased(b, _) => {
+                    st.buttons.insert(format!("{:?}", b), 0.0);
+                }
+                EventType::ButtonChanged(b, v, _) => {
+                    st.buttons.insert(format!("{:?}", b), v);
+                }
+
+                EventType::AxisChanged(a, v, _) => {
+                    st.axes.insert(format!("{:?}", a), v);
+                }
+
+                _ => {}
+            }
+        }
+    }
+
+    fn end_frame(&self) {
+        let mut g = state().lock();
+
+        g.keys.pressed.clear();
+        g.keys.released.clear();
+
+        g.mouse.pressed.clear();
+        g.mouse.released.clear();
+
+        g.mouse.dx = 0.0;
+        g.mouse.dy = 0.0;
+        g.mouse.wheel_x = 0.0;
+        g.mouse.wheel_y = 0.0;
+
+        // Keep commit until taken; preedit is frame-local.
+        g.text.ime_preedit.clear();
     }
 }
 
@@ -98,232 +428,49 @@ impl PluginModule for InputPlugin {
     fn info(&self) -> PluginInfo {
         PluginInfo {
             id: RString::from(env!("CARGO_PKG_NAME")),
+            name: RString::from("NewEngine Input"),
             version: RString::from(env!("CARGO_PKG_VERSION")),
         }
     }
 
     fn init(&mut self, host: HostApiV1) -> RResult<(), RString> {
-        // Initialize global state once. If it already exists (hot reload / re-init), reset it.
-        if STATE.set(Mutex::new(State::default())).is_err() {
-            if let Some(m) = state_opt() {
-                if let Ok(mut g) = m.lock() {
-                    *g = State::default();
-                }
-            }
+        let sink: EventSinkV1Dyn<'static> = EventSinkV1_TO::from_value(InputEventSink, TD_Opaque);
+        if let Err(e) = (host.subscribe_events_v1)(sink).into_result() {
+            return RResult::RErr(RString::from(format!(
+                "input: subscribe_events_v1 failed: {}",
+                e
+            )));
         }
 
-        let sink: HostEventSinkDyn<'static> =
-            HostEventSink_TO::from_value(InputHostSink, TD_Opaque);
-
-        match (host.subscribe_host_events)(sink).into_result() {
-            Ok(()) => {}
-            Err(e) => return RResult::RErr(e),
+        let svc: ServiceV1Dyn<'static> = ServiceV1_TO::from_value(InputService, TD_Opaque);
+        if let Err(e) = (host.register_service_v1)(svc).into_result() {
+            return RResult::RErr(RString::from(format!(
+                "input: register_service_v1 failed: {}",
+                e
+            )));
         }
 
-        let api: InputApiV1Dyn<'static> = InputApiV1_TO::from_value(InputApi, TD_Opaque);
-
-        match (host.provide_input_api_v1)(api).into_result() {
-            Ok(()) => {}
-            Err(e) => return RResult::RErr(e),
-        }
-
-        ok_unit()
+        //(host.log_info)(RString::from("input: initialized (events + gilrs)"));
+        RResult::ROk(())
     }
 
     fn start(&mut self) -> RResult<(), RString> {
-        ok_unit()
+        RResult::ROk(())
     }
 
     fn fixed_update(&mut self, _dt: f32) -> RResult<(), RString> {
-        ok_unit()
+        RResult::ROk(())
     }
 
     fn update(&mut self, _dt: f32) -> RResult<(), RString> {
-        // Per-frame cleanup: deltas + edge flags.
-        let Some(m) = state_opt() else { return ok_unit(); };
-        let Ok(mut g) = m.lock() else { return ok_unit(); };
-
-        g.mouse_delta = Vec2fAbi::new(0.0, 0.0);
-        g.wheel_delta = Vec2fAbi::new(0.0, 0.0);
-
-        g.mouse_pressed_bits = 0;
-        g.mouse_released_bits = 0;
-
-        for v in g.keys_pressed.iter_mut() {
-            *v = false;
-        }
-        for v in g.keys_released.iter_mut() {
-            *v = false;
-        }
-
-        ok_unit()
+        self.poll_gilrs();
+        self.end_frame();
+        RResult::ROk(())
     }
 
     fn render(&mut self, _dt: f32) -> RResult<(), RString> {
-        ok_unit()
+        RResult::ROk(())
     }
 
-    fn shutdown(&mut self) {
-        // Keep STATE allocated; the DLL will be unloaded anyway.
-    }
-}
-
-#[derive(StableAbi)]
-#[repr(C)]
-struct InputHostSink;
-
-impl HostEventSink for InputHostSink {
-    fn on_host_event(&mut self, ev: HostEventAbi) {
-        let Some(m) = state_opt() else { return; };
-        let Ok(mut g) = m.lock() else { return; };
-
-        match ev {
-            HostEventAbi::Input(ie) => match ie {
-                InputHostEventAbi::Key { code, state, repeat } => {
-                    let i = key_idx(code);
-                    let was_down = g.keys_down[i];
-                    let is_down = state == KeyStateAbi::Pressed;
-
-                    g.keys_down[i] = is_down;
-
-                    if repeat {
-                        // Repeat does not emit edges.
-                        return;
-                    }
-
-                    g.keys_pressed[i] = is_down && !was_down;
-                    g.keys_released[i] = !is_down && was_down;
-                }
-
-                InputHostEventAbi::MouseMove { pos } => {
-                    g.mouse_pos = pos;
-                }
-
-                InputHostEventAbi::MouseDelta { delta } => {
-                    g.mouse_delta =
-                        Vec2fAbi::new(g.mouse_delta.x + delta.x, g.mouse_delta.y + delta.y);
-                }
-
-                InputHostEventAbi::MouseWheel { delta } => {
-                    g.wheel_delta =
-                        Vec2fAbi::new(g.wheel_delta.x + delta.x, g.wheel_delta.y + delta.y);
-                }
-
-                InputHostEventAbi::MouseButton { button, state } => {
-                    let bit = mouse_bit(button);
-                    let was = (g.mouse_down_bits & bit) != 0;
-                    let is = state == KeyStateAbi::Pressed;
-
-                    if is {
-                        g.mouse_down_bits |= bit;
-                    } else {
-                        g.mouse_down_bits &= !bit;
-                    }
-
-                    if is && !was {
-                        g.mouse_pressed_bits |= bit;
-                    }
-                    if !is && was {
-                        g.mouse_released_bits |= bit;
-                    }
-                }
-            },
-
-            HostEventAbi::Text(te) => match te {
-                TextHostEventAbi::CharU32(cp) => {
-                    if let Some(ch) = char::from_u32(cp) {
-                        g.text.push(ch);
-                    }
-                }
-                TextHostEventAbi::ImePreedit(s) => {
-                    g.ime_preedit.clear();
-                    g.ime_preedit.push_str(&s);
-                }
-                TextHostEventAbi::ImeCommit(s) => {
-                    g.ime_commit.clear();
-                    g.ime_commit.push_str(&s);
-                }
-            },
-
-            HostEventAbi::Window(_) => {}
-        }
-    }
-}
-
-#[derive(StableAbi)]
-#[repr(C)]
-struct InputApi;
-
-impl InputApiV1 for InputApi {
-    fn key_down(&self, key: KeyCodeAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        g.keys_down[key_idx(key)]
-    }
-
-    fn key_pressed(&self, key: KeyCodeAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        g.keys_pressed[key_idx(key)]
-    }
-
-    fn key_released(&self, key: KeyCodeAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        g.keys_released[key_idx(key)]
-    }
-
-    fn mouse_pos(&self) -> Vec2fAbi {
-        let Some(m) = state_opt() else { return Vec2fAbi::new(0.0, 0.0); };
-        let Ok(g) = m.lock() else { return Vec2fAbi::new(0.0, 0.0); };
-        g.mouse_pos
-    }
-
-    fn mouse_delta(&self) -> Vec2fAbi {
-        let Some(m) = state_opt() else { return Vec2fAbi::new(0.0, 0.0); };
-        let Ok(g) = m.lock() else { return Vec2fAbi::new(0.0, 0.0); };
-        g.mouse_delta
-    }
-
-    fn wheel_delta(&self) -> Vec2fAbi {
-        let Some(m) = state_opt() else { return Vec2fAbi::new(0.0, 0.0); };
-        let Ok(g) = m.lock() else { return Vec2fAbi::new(0.0, 0.0); };
-        g.wheel_delta
-    }
-
-    fn mouse_down(&self, btn: MouseButtonAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        (g.mouse_down_bits & mouse_bit(btn)) != 0
-    }
-
-    fn mouse_pressed(&self, btn: MouseButtonAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        (g.mouse_pressed_bits & mouse_bit(btn)) != 0
-    }
-
-    fn mouse_released(&self, btn: MouseButtonAbi) -> bool {
-        let Some(m) = state_opt() else { return false; };
-        let Ok(g) = m.lock() else { return false; };
-        (g.mouse_released_bits & mouse_bit(btn)) != 0
-    }
-
-    fn text_take(&self) -> RString {
-        let Some(m) = state_opt() else { return RString::new(); };
-        let Ok(mut g) = m.lock() else { return RString::new(); };
-        RString::from(std::mem::take(&mut g.text))
-    }
-
-    fn ime_preedit(&self) -> RString {
-        let Some(m) = state_opt() else { return RString::new(); };
-        let Ok(g) = m.lock() else { return RString::new(); };
-        RString::from(g.ime_preedit.as_str())
-    }
-
-    fn ime_commit_take(&self) -> RString {
-        let Some(m) = state_opt() else { return RString::new(); };
-        let Ok(mut g) = m.lock() else { return RString::new(); };
-        RString::from(std::mem::take(&mut g.ime_commit))
-    }
+    fn shutdown(&mut self) {}
 }
