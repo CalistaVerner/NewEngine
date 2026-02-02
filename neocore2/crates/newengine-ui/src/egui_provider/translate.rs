@@ -7,27 +7,21 @@ pub fn egui_output_to_draw_list(ctx: &egui::Context, output: egui::FullOutput, o
     let pixels_per_point = ctx.pixels_per_point();
     out.pixels_per_point = pixels_per_point;
 
-    // Viewport size in points; convert to physical pixels.
     let screen_rect = ctx.screen_rect();
     let w_px = (screen_rect.width() * pixels_per_point).round().max(0.0) as u32;
     let h_px = (screen_rect.height() * pixels_per_point).round().max(0.0) as u32;
     out.screen_size_px = [w_px, h_px];
 
-    // Texture deltas (font atlas etc.)
     apply_texture_delta(&output.textures_delta, &mut out.texture_delta);
 
-    // Tessellate shapes -> meshes
     let clipped_primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
 
-    // Flatten into one mesh with multiple draw commands.
     for egui::ClippedPrimitive { clip_rect, primitive } in clipped_primitives {
         let clip = clip_rect_to_px(clip_rect, pixels_per_point);
 
         match primitive {
             egui::epaint::Primitive::Mesh(m) => push_egui_mesh(&m, clip, pixels_per_point, &mut out.mesh),
-            egui::epaint::Primitive::Callback(_) => {
-                // Callbacks are intentionally ignored in this backend-agnostic layer.
-            }
+            egui::epaint::Primitive::Callback(_) => {}
         }
     }
 }
@@ -56,7 +50,6 @@ fn push_egui_mesh(mesh: &egui::epaint::Mesh, clip: UiRect, ppp: f32, out: &mut U
         let pos_px = [v.pos.x * ppp, v.pos.y * ppp];
         let uv = [v.uv.x, v.uv.y];
         let color = egui_color_to_rgba8(v.color);
-
         out.vertices.push(UiVertex { pos: pos_px, uv, color });
     }
 
@@ -80,16 +73,13 @@ fn egui_color_to_rgba8(c: egui::Color32) -> u32 {
 
 #[inline]
 fn u64_to_u32_checked(v: u64, what: &'static str) -> u32 {
-    u32::try_from(v).unwrap_or_else(|_| {
-        panic!("{what} out of u32 range: {v}");
-    })
+    u32::try_from(v).unwrap_or_else(|_| panic!("{what} out of u32 range: {v}"))
 }
 
 #[inline]
 fn egui_texid_to_engine(id: egui::TextureId) -> UiTexId {
     match id {
         egui::TextureId::Managed(mid) => {
-            // Reserve FONT_ATLAS for managed 0 by convention.
             if mid == 0 {
                 reserved::FONT_ATLAS
             } else {
@@ -107,7 +97,6 @@ fn egui_texid_to_engine(id: egui::TextureId) -> UiTexId {
 fn apply_texture_delta(delta: &egui::TexturesDelta, out: &mut UiTextureDelta) {
     for (id, image_delta) in &delta.set {
         let tex_id = egui_texid_to_engine(*id);
-
         let (w, h, rgba8) = image_delta_to_rgba8(&image_delta.image);
 
         if let Some([x, y]) = image_delta.pos {
@@ -129,8 +118,7 @@ fn apply_texture_delta(delta: &egui::TexturesDelta, out: &mut UiTextureDelta) {
 
 #[inline]
 fn f32_alpha_to_u8(a: f32) -> u8 {
-    let a = a.clamp(0.0, 1.0) * 255.0;
-    a.round() as u8
+    (a.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn image_delta_to_rgba8(img: &egui::ImageData) -> (u32, u32, Vec<u8>) {
@@ -147,8 +135,6 @@ fn image_delta_to_rgba8(img: &egui::ImageData) -> (u32, u32, Vec<u8>) {
         egui::ImageData::Font(fimg) => {
             let w = fimg.size[0] as u32;
             let h = fimg.size[1] as u32;
-
-            // Font image is alpha in 0..1 (f32); expand to RGBA where RGB=255, A=alpha.
             let mut rgba8 = Vec::with_capacity((w * h * 4) as usize);
             for &a in &fimg.pixels {
                 let a8 = f32_alpha_to_u8(a);

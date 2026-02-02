@@ -1,17 +1,12 @@
 use crate::draw::UiTexId;
 
-/// Reserved texture IDs for engine-level UI.
 pub mod reserved {
     use super::UiTexId;
 
-    /// Font atlas texture ID.
     pub const FONT_ATLAS: UiTexId = UiTexId(1);
-
-    /// First user-allocated texture ID.
     pub const USER_BEGIN: u32 = 16;
 }
 
-/// Monotonic texture ID allocator owned by UI layer.
 #[derive(Debug, Default)]
 pub struct UiTexAllocator {
     next: u32,

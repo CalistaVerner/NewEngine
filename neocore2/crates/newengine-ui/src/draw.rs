@@ -2,8 +2,6 @@ use ahash::AHashMap;
 use bytemuck::{Pod, Zeroable};
 use smallvec::SmallVec;
 
-/// A stable UI texture handle owned by the UI system.
-/// Renderer side maps this to an actual GPU texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct UiTexId(pub u32);
@@ -15,7 +13,6 @@ impl UiTexId {
     }
 }
 
-/// 2D rectangle in physical pixels (top-left origin).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct UiRect {
@@ -42,8 +39,6 @@ impl UiRect {
     }
 }
 
-/// Vertex format designed for fast GPU upload.
-/// Color is RGBA8 in sRGB UI space (renderer decides conversion).
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 #[repr(C)]
 pub struct UiVertex {
@@ -52,7 +47,6 @@ pub struct UiVertex {
     pub color: u32,
 }
 
-/// A single draw call: indexed triangle list with a clip rect and texture.
 #[derive(Debug, Clone)]
 pub struct UiDrawCmd {
     pub texture: UiTexId,
@@ -60,7 +54,6 @@ pub struct UiDrawCmd {
     pub index_range: std::ops::Range<u32>,
 }
 
-/// One mesh batch: vertices + indices + commands referencing them.
 #[derive(Debug, Clone)]
 pub struct UiMesh {
     pub vertices: Vec<UiVertex>,
@@ -86,16 +79,11 @@ impl UiMesh {
     }
 }
 
-/// A full draw list for the current frame.
 #[derive(Debug, Clone)]
 pub struct UiDrawList {
-    /// Physical screen size in pixels.
     pub screen_size_px: [u32; 2],
-    /// DPI scale factor (physical / logical).
     pub pixels_per_point: f32,
-    /// Mesh batches.
     pub mesh: UiMesh,
-    /// Texture updates required by UI (font atlas etc.).
     pub texture_delta: UiTextureDelta,
 }
 
@@ -117,20 +105,12 @@ impl UiDrawList {
     }
 }
 
-/// A CPU-side texture used to update renderer-owned textures.
 #[derive(Debug, Clone)]
 pub struct UiTexture {
     pub size: [u32; 2],
-    /// RGBA8 pixels row-major; length must be size.x * size.y * 4.
     pub rgba8: Vec<u8>,
 }
 
-/// Incremental texture updates for the frame.
-///
-/// Renderer contract:
-/// - Apply `set` first (create/replace full textures).
-/// - Then apply `patches` (sub-rect updates).
-/// - Then process `free`.
 #[derive(Debug, Clone)]
 pub struct UiTextureDelta {
     pub set: AHashMap<UiTexId, UiTexture>,
@@ -156,12 +136,10 @@ impl UiTextureDelta {
     }
 }
 
-/// Sub-rect patch into an existing texture.
 #[derive(Debug, Clone)]
 pub struct UiTexturePatch {
     pub id: UiTexId,
     pub origin: [u32; 2],
     pub size: [u32; 2],
-    /// RGBA8 pixels row-major; length must be size.x * size.y * 4.
     pub rgba8: Vec<u8>,
 }

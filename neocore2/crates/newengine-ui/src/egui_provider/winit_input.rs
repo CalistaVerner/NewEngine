@@ -14,6 +14,7 @@ impl EguiWinitInput {
             window,
             Some(window.scale_factor() as f32),
             None,
+            None,
         );
 
         Self {
@@ -23,13 +24,12 @@ impl EguiWinitInput {
     }
 
     #[inline]
-    pub fn on_event<T>(&mut self, window: &winit::window::Window, event: &winit::event::Event<T>) {
-        match event {
-            winit::event::Event::WindowEvent { event, window_id } if *window_id == window.id() => {
-                let _ = self.state.on_window_event(window, event);
-            }
-            _ => {}
-        }
+    pub fn on_window_event(
+        &mut self,
+        window: &winit::window::Window,
+        event: &winit::event::WindowEvent,
+    ) {
+        let _ = self.state.on_window_event(window, event);
     }
 
     #[inline]
@@ -48,7 +48,8 @@ impl EguiWinitInput {
         window: &winit::window::Window,
         output: egui::FullOutput,
     ) -> egui::FullOutput {
-        self.state.handle_platform_output(window, output.platform_output.clone());
+        self.state
+            .handle_platform_output(window, output.platform_output.clone());
         output
     }
 }

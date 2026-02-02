@@ -8,10 +8,12 @@ pub use winit_input::*;
 
 use crate::draw::UiDrawList;
 
+/// UI frame output from egui.
 pub struct EguiFrameOutput {
     pub draw_list: UiDrawList,
 }
 
+/// High-level egui UI driver. Does not know about renderer.
 pub struct EguiUi {
     ctx: egui::Context,
     input: EguiWinitInput,
@@ -41,6 +43,7 @@ impl EguiUi {
         &mut self.input
     }
 
+    /// Run one UI frame.
     pub fn run_frame<F>(&mut self, window: &winit::window::Window, build: F) -> EguiFrameOutput
     where
         F: FnOnce(&egui::Context),
