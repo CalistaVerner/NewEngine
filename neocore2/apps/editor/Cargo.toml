@@ -12,8 +12,3 @@ newengine-ui = { path = "../../crates/newengine-ui" }
 newengine-platform-winit = { path = "../../crates/newengine-platform-winit" }
 newengine-modules-logging = { path = "../../crates/newengine-modules-logging" }
 newengine-modules-render-vulkan-ash = { path = "../../crates/newengine-modules-render-vulkan-ash" }
-
-[features]
-default = []
-egui = ["newengine-ui/egui"]
-winit = ["newengine-ui/winit"]

@@ -78,6 +78,26 @@ impl<'a, E: Send + 'static> ModuleCtx<'a, E> {
         self.resources.api_required::<T>(id)
     }
 
+    /// Takes a typed resource out of the engine storage.
+    /// Returns `None` if the resource is not present.
+    #[inline]
+    pub fn take<T>(&mut self) -> Option<T>
+    where
+        T: std::any::Any + 'static,
+    {
+        self.resources.remove::<T>()
+    }
+
+    /// Takes a typed resource out of the engine storage.
+    /// Returns an error if the resource is not present.
+    #[inline]
+    pub fn take_required<T>(&mut self, name: &'static str) -> crate::error::EngineResult<T>
+    where
+        T: std::any::Any + 'static,
+    {
+        self.resources.take_required::<T>(name)
+    }
+
     #[inline]
     pub fn bus(&self) -> &Bus<E> {
         self.bus
