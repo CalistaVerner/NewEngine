@@ -4,6 +4,7 @@ mod vulkan;
 
 use newengine_core::render::{BeginFrameDesc, RenderApiRef, RENDER_API_ID, RENDER_API_PROVIDE};
 use newengine_core::{EngineError, EngineResult, Module, ModuleCtx};
+use newengine_ui::draw::UiDrawList;
 
 use newengine_platform_winit::{WinitWindowHandles, WinitWindowInitSize};
 
@@ -49,10 +50,9 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
 
     fn init(&mut self, ctx: &mut ModuleCtx<'_, E>) -> EngineResult<()> {
         let (display, window, w, h) = {
-            let handles = ctx
-                .resources()
-                .get::<WinitWindowHandles>()
-                .ok_or_else(|| EngineError::other(VkRenderError::MissingWindowHandles.to_string()))?;
+            let handles = ctx.resources().get::<WinitWindowHandles>().ok_or_else(|| {
+                EngineError::other(VkRenderError::MissingWindowHandles.to_string())
+            })?;
 
             let size = ctx
                 .resources()
@@ -72,7 +72,8 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
             self.config.debug_text.clone(),
         ));
 
-        ctx.resources_mut().register_api(RENDER_API_ID, api.clone())?;
+        ctx.resources_mut()
+            .register_api(RENDER_API_ID, api.clone())?;
 
         self.api = Some(api);
         self.last_w = w;
@@ -85,6 +86,11 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
         let Some(api) = self.api.as_ref() else {
             return Ok(());
         };
+
+        // 1) Take UI draw list (one-shot) produced by winit/egui.
+        if let Some(ui) = ctx.resources_mut().remove::<UiDrawList>() {
+            api.lock().set_ui_draw_list(ui);
+        }
 
         let (w, h) = ctx
             .resources()

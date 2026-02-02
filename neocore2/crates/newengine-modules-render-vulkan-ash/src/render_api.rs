@@ -1,6 +1,6 @@
 use newengine_core::render::*;
 use newengine_core::{EngineError, EngineResult};
-
+use newengine_ui::draw::UiDrawList;
 use crate::vulkan::VulkanRenderer;
 
 pub struct VulkanRenderApi {
@@ -17,6 +17,11 @@ impl VulkanRenderApi {
             target: Extent2D::new(width, height),
             debug_text,
         }
+    }
+
+    #[inline]
+    pub fn set_ui_draw_list(&mut self, ui: UiDrawList) {
+        self.renderer.set_ui_draw_list(ui);
     }
 
     #[inline]
@@ -38,6 +43,11 @@ impl RenderApi for VulkanRenderApi {
             .map_err(|e| EngineError::other(e.to_string()))?;
 
         Ok(())
+    }
+
+    #[inline]
+    fn set_ui_draw_list(&mut self, ui: UiDrawList) {
+        self.renderer.set_ui_draw_list(ui);
     }
 
     fn end_frame(&mut self) -> EngineResult<()> {

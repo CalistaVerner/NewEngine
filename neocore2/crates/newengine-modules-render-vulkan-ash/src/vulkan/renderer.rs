@@ -5,7 +5,7 @@ use ash::{Device, Entry, Instance};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::ffi::CString;
 use std::time::Instant;
-
+use newengine_ui::draw::UiDrawList;
 use super::device::*;
 use super::instance::*;
 use super::pipeline::*;
@@ -77,6 +77,25 @@ pub struct VulkanRenderer {
     pub(super) text_vb: vk::Buffer,
     pub(super) text_vb_mem: vk::DeviceMemory,
     pub(super) text_vb_size: vk::DeviceSize,
+    pub(super) pending_ui: Option<UiDrawList>,
+
+    pub(super) ui_pipeline_layout: vk::PipelineLayout,
+    pub(super) ui_pipeline: vk::Pipeline,
+
+    pub(super) ui_desc_set_layout: vk::DescriptorSetLayout,
+    pub(super) ui_desc_pool: vk::DescriptorPool,
+    pub(super) ui_sampler: vk::Sampler,
+
+    pub(super) ui_textures: std::collections::HashMap<u32, super::ui::GpuUiTexture>,
+
+    pub(super) ui_vb: vk::Buffer,
+    pub(super) ui_vb_mem: vk::DeviceMemory,
+    pub(super) ui_vb_size: vk::DeviceSize,
+
+    pub(super) ui_ib: vk::Buffer,
+    pub(super) ui_ib_mem: vk::DeviceMemory,
+    pub(super) ui_ib_size: vk::DeviceSize,
+
 }
 
 impl VulkanRenderer {
@@ -254,9 +273,29 @@ impl VulkanRenderer {
             text_vb: vk::Buffer::null(),
             text_vb_mem: vk::DeviceMemory::null(),
             text_vb_size: 0,
+            pending_ui: None,
+
+            ui_pipeline_layout: vk::PipelineLayout::null(),
+            ui_pipeline: vk::Pipeline::null(),
+
+            ui_desc_set_layout: vk::DescriptorSetLayout::null(),
+            ui_desc_pool: vk::DescriptorPool::null(),
+            ui_sampler: vk::Sampler::null(),
+
+            ui_textures: std::collections::HashMap::new(),
+
+            ui_vb: vk::Buffer::null(),
+            ui_vb_mem: vk::DeviceMemory::null(),
+            ui_vb_size: 0,
+
+            ui_ib: vk::Buffer::null(),
+            ui_ib_mem: vk::DeviceMemory::null(),
+            ui_ib_size: 0,
+
         };
 
         me.init_text_overlay()?;
+        me.init_ui_overlay()?;
         Ok(me)
     }
 
@@ -293,6 +332,12 @@ impl VulkanRenderer {
     #[inline]
     pub fn draw_clear(&mut self) -> VkResult<()> {
         self.draw_clear_color([0.10, 0.12, 0.16, 1.0])
+    }
+
+    /// Stores UI draw list for the next presented frame.
+    #[inline]
+    pub fn set_ui_draw_list(&mut self, ui: UiDrawList) {
+        self.pending_ui = Some(ui);
     }
 
     pub fn draw_clear_color(&mut self, rgba: [f32; 4]) -> VkResult<()> {
@@ -415,6 +460,11 @@ impl VulkanRenderer {
             let dbg = self.debug_text.clone();
             self.draw_text_overlay(cmd, &dbg)?;
 
+            if let Some(list) = self.pending_ui.take() {
+                self.ui_upload_and_draw(cmd, &list)?;
+            }
+
+
             self.device.cmd_end_render_pass(cmd);
 
             transition_image(
@@ -475,7 +525,10 @@ impl Drop for VulkanRenderer {
         unsafe {
             let _ = self.device.device_wait_idle();
 
+            // Destroy overlays while device is alive
+            self.destroy_ui_overlay();
             self.destroy_text_overlay();
+
             self.device.destroy_command_pool(self.upload_command_pool, None);
 
             for f in &self.frames {
@@ -499,8 +552,7 @@ impl Drop for VulkanRenderer {
                 self.device.destroy_image_view(iv, None);
             }
 
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None);
+            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
 
             self.device.destroy_device(None);

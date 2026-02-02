@@ -3,6 +3,7 @@ mod instance;
 mod pipeline;
 mod swapchain;
 mod text;
+mod ui;
 mod util;
 
 mod renderer;
