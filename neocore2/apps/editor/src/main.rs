@@ -1,10 +1,11 @@
 use crossbeam_channel::unbounded;
 
 use newengine_core::{
-    Bus, ConfigPaths, Engine, EngineResult, Services, ShutdownToken, StartupDefaults, StartupLoader,
+    AssetManagerConfig, Bus, ConfigPaths, Engine, EngineConfig, EngineResult, Services,
+    ShutdownToken, StartupConfig, StartupDefaults, StartupLoader, WindowPlacement,
 };
 use newengine_modules_logging::{ConsoleLoggerConfig, ConsoleLoggerModule};
-use newengine_modules_render_vulkan_ash::VulkanAshRenderModule;
+use newengine_modules_render_vulkan_ash::{VulkanAshRenderModule, VulkanRenderConfig};
 use newengine_platform_winit::{run_winit_app_with_config, WinitAppConfig, WinitWindowPlacement};
 
 struct AppServices;
@@ -23,14 +24,30 @@ impl Services for AppServices {
     }
 }
 
-fn build_engine() -> EngineResult<Engine<()>> {
+fn build_engine_from_startup(startup: &StartupConfig) -> EngineResult<Engine<()>> {
     let (tx, rx) = unbounded::<()>();
     let bus: Bus<()> = Bus::new(tx, rx);
 
     let services: Box<dyn Services> = Box::new(AppServices::new());
     let shutdown = ShutdownToken::new();
 
-    let mut engine: Engine<()> = Engine::new(16, services, bus, shutdown)?;
+    let assets_root = startup.assets_root.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("assets")
+    });
+
+    let mut assets = AssetManagerConfig::new(assets_root);
+    if let Some(steps) = startup.asset_pump_steps {
+        assets = assets.with_pump_steps(steps);
+    }
+    if let Some(enabled) = startup.asset_filesystem_source {
+        assets = assets.with_filesystem_source(enabled);
+    }
+
+    let config = EngineConfig::new(16, assets).with_plugins_dir(startup.modules_dir.clone());
+
+    let mut engine: Engine<()> = Engine::new_with_config(config, services, bus, shutdown)?;
 
     engine.register_module(Box::new(ConsoleLoggerModule::new(
         ConsoleLoggerConfig::from_env(),
@@ -48,6 +65,12 @@ fn main() -> EngineResult<()> {
         window_size: Some((1600, 900)),
         window_placement: None,
         modules_dir: None,
+        assets_root: None,
+        asset_pump_steps: Some(8),
+        asset_filesystem_source: Some(true),
+        render_backend: Some("vulkan_ash".to_owned()),
+        render_clear_color: Some([0.0, 0.0, 0.0, 1.0]),
+        render_debug_text: None,
     };
 
     // Single reusable call: returns config + ready-to-log report
@@ -72,18 +95,38 @@ fn main() -> EngineResult<()> {
         .clone()
         .unwrap_or_else(|| "NewEngine".to_owned());
     let (w, h) = startup.window_size.unwrap_or((1280, 720));
+    let placement = match startup.window_placement.clone().unwrap_or(WindowPlacement::Default) {
+        WindowPlacement::Centered { offset } => WinitWindowPlacement::Centered { offset },
+        WindowPlacement::Default => WinitWindowPlacement::OsDefault,
+    };
 
     let cfg = WinitAppConfig {
         title,
         size: (w, h),
-        placement: WinitWindowPlacement::Centered { offset: (0, -24) },
+        placement,
         ..WinitAppConfig::default()
     };
 
-    let engine = build_engine()?;
+    let engine = build_engine_from_startup(&startup)?;
 
     run_winit_app_with_config(engine, cfg, |engine| {
-        engine.register_module(Box::new(VulkanAshRenderModule::default()))?;
+        let backend = startup
+            .render_backend
+            .clone()
+            .unwrap_or_else(|| "vulkan_ash".to_owned());
+        if backend.eq_ignore_ascii_case("vulkan_ash") {
+            let config = VulkanRenderConfig {
+                clear_color: startup
+                    .render_clear_color
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                debug_text: startup.render_debug_text.clone(),
+            };
+            engine.register_module(Box::new(VulkanAshRenderModule::new(config)))?;
+        } else {
+            return Err(EngineError::other(format!(
+                "unsupported render backend '{backend}'"
+            )));
+        }
         Ok(())
     })?;
 

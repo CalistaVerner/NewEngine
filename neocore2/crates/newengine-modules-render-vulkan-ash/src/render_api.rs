@@ -6,14 +6,16 @@ use crate::vulkan::VulkanRenderer;
 pub struct VulkanRenderApi {
     renderer: VulkanRenderer,
     target: Extent2D,
+    debug_text: Option<String>,
 }
 
 impl VulkanRenderApi {
     #[inline]
-    pub fn new(renderer: VulkanRenderer, width: u32, height: u32) -> Self {
+    pub fn new(renderer: VulkanRenderer, width: u32, height: u32, debug_text: Option<String>) -> Self {
         Self {
             renderer,
             target: Extent2D::new(width, height),
+            debug_text,
         }
     }
 
@@ -27,7 +29,9 @@ impl VulkanRenderApi {
 
 impl RenderApi for VulkanRenderApi {
     fn begin_frame(&mut self, desc: BeginFrameDesc) -> EngineResult<()> {
-        self.renderer.set_debug_text("TEST OK");
+        if let Some(text) = &self.debug_text {
+            self.renderer.set_debug_text(text);
+        }
 
         self.renderer
             .draw_clear_color(desc.clear_color)

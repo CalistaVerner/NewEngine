@@ -30,6 +30,12 @@ impl StartupLoader {
         cfg.window_size = defaults.window_size;
         cfg.window_placement = defaults.window_placement.clone();
         cfg.modules_dir = defaults.modules_dir.clone();
+        cfg.assets_root = defaults.assets_root.clone();
+        cfg.asset_pump_steps = defaults.asset_pump_steps;
+        cfg.asset_filesystem_source = defaults.asset_filesystem_source;
+        cfg.render_backend = defaults.render_backend.clone();
+        cfg.render_clear_color = defaults.render_clear_color;
+        cfg.render_debug_text = defaults.render_debug_text.clone();
         cfg.source = StartupConfigSource::Defaults;
 
         if let Some(raw_path) = paths.startup_path() {
@@ -76,10 +82,8 @@ impl StartupLoader {
 struct RootJson {
     window: Option<WindowJson>,
     logging: Option<LoggingJson>,
-    #[allow(dead_code)]
-    engine: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    render: Option<serde_json::Value>,
+    engine: Option<EngineJson>,
+    render: Option<RenderJson>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +111,21 @@ struct WindowPlacementJson {
     #[serde(rename = "type")]
     kind: Option<String>,
     offset: Option<[i32; 2]>,
+}
+
+#[derive(Deserialize)]
+struct EngineJson {
+    assets_root: Option<String>,
+    asset_pump_steps: Option<u32>,
+    asset_filesystem_source: Option<bool>,
+    modules_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RenderJson {
+    backend: Option<String>,
+    clear_color: Option<[f32; 4]>,
+    debug_text: Option<String>,
 }
 
 fn apply_root(cfg: &mut StartupConfig, report: &mut StartupLoadReport, src: RootJson) {
@@ -141,6 +160,38 @@ fn apply_root(cfg: &mut StartupConfig, report: &mut StartupLoadReport, src: Root
             if let Some(pl) = parse_placement(p) {
                 apply_placement(report, "window_placement", &mut cfg.window_placement, pl);
             }
+        }
+    }
+
+    if let Some(engine) = src.engine {
+        if let Some(root) = engine.assets_root {
+            apply_path(report, "assets_root", &mut cfg.assets_root, root);
+        }
+        if let Some(steps) = engine.asset_pump_steps {
+            apply_u32(report, "asset_pump_steps", &mut cfg.asset_pump_steps, steps);
+        }
+        if let Some(enabled) = engine.asset_filesystem_source {
+            apply_bool(
+                report,
+                "asset_filesystem_source",
+                &mut cfg.asset_filesystem_source,
+                enabled,
+            );
+        }
+        if let Some(dir) = engine.modules_dir {
+            apply_path(report, "modules_dir", &mut cfg.modules_dir, dir);
+        }
+    }
+
+    if let Some(render) = src.render {
+        if let Some(backend) = render.backend {
+            apply_string(report, "render_backend", &mut cfg.render_backend, backend);
+        }
+        if let Some(color) = render.clear_color {
+            apply_color(report, "render_clear_color", &mut cfg.render_clear_color, color);
+        }
+        if let Some(text) = render.debug_text {
+            apply_string(report, "render_debug_text", &mut cfg.render_debug_text, text);
         }
     }
 }
@@ -208,6 +259,68 @@ fn apply_placement(
     });
 }
 
+fn apply_path(
+    report: &mut StartupLoadReport,
+    key: &'static str,
+    slot: &mut Option<PathBuf>,
+    to: String,
+) {
+    let from = slot
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".to_owned());
+    let to_path = PathBuf::from(&to);
+    *slot = Some(to_path);
+    report.overrides.push(StartupOverride { key, from, to });
+}
+
+fn apply_u32(
+    report: &mut StartupLoadReport,
+    key: &'static str,
+    slot: &mut Option<u32>,
+    to: u32,
+) {
+    let from = slot
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unset>".to_owned());
+    *slot = Some(to);
+    report
+        .overrides
+        .push(StartupOverride { key, from, to: to.to_string() });
+}
+
+fn apply_bool(
+    report: &mut StartupLoadReport,
+    key: &'static str,
+    slot: &mut Option<bool>,
+    to: bool,
+) {
+    let from = slot
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unset>".to_owned());
+    *slot = Some(to);
+    report
+        .overrides
+        .push(StartupOverride { key, from, to: to.to_string() });
+}
+
+fn apply_color(
+    report: &mut StartupLoadReport,
+    key: &'static str,
+    slot: &mut Option<[f32; 4]>,
+    to: [f32; 4],
+) {
+    let from = slot
+        .map(format_color)
+        .unwrap_or_else(|| "<unset>".to_owned());
+    *slot = Some(to);
+    report.overrides.push(StartupOverride {
+        key,
+        from,
+        to: format_color(to),
+    });
+}
+
 fn format_placement(p: &WindowPlacement) -> String {
     match p {
         WindowPlacement::Centered { offset } => {
@@ -220,6 +333,10 @@ fn format_placement(p: &WindowPlacement) -> String {
 fn format_opt_size(v: Option<(u32, u32)>) -> String {
     v.map(|(w, h)| format!("{}x{}", w, h))
         .unwrap_or_else(|| "<unset>".to_owned())
+}
+
+fn format_color(v: [f32; 4]) -> String {
+    format!("{:.3},{:.3},{:.3},{:.3}", v[0], v[1], v[2], v[3])
 }
 
 fn resolve_startup_file_optional(

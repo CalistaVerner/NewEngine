@@ -94,6 +94,12 @@ pub struct StartupConfig {
     pub window_size: Option<(u32, u32)>,
     pub window_placement: Option<WindowPlacement>,
     pub modules_dir: Option<PathBuf>,
+    pub assets_root: Option<PathBuf>,
+    pub asset_pump_steps: Option<u32>,
+    pub asset_filesystem_source: Option<bool>,
+    pub render_backend: Option<String>,
+    pub render_clear_color: Option<[f32; 4]>,
+    pub render_debug_text: Option<String>,
 
     pub extra: HashMap<String, String>,
 }
@@ -108,6 +114,12 @@ impl Default for StartupConfig {
             window_size: None,
             window_placement: None,
             modules_dir: None,
+            assets_root: None,
+            asset_pump_steps: None,
+            asset_filesystem_source: None,
+            render_backend: None,
+            render_clear_color: None,
+            render_debug_text: None,
             extra: HashMap::new(),
         }
     }
@@ -120,6 +132,12 @@ pub struct StartupDefaults {
     pub window_size: Option<(u32, u32)>,
     pub window_placement: Option<WindowPlacement>,
     pub modules_dir: Option<PathBuf>,
+    pub assets_root: Option<PathBuf>,
+    pub asset_pump_steps: Option<u32>,
+    pub asset_filesystem_source: Option<bool>,
+    pub render_backend: Option<String>,
+    pub render_clear_color: Option<[f32; 4]>,
+    pub render_debug_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -12,11 +12,11 @@ mod system_info;
 pub mod render;
 pub mod startup;
 pub mod assets;
-pub use assets::AssetManager;
+pub use assets::{AssetManager, AssetManagerConfig};
 
 
 pub use bus::Bus;
-pub use engine::Engine;
+pub use engine::{Engine, EngineConfig};
 pub use error::{EngineError, EngineResult, ModuleStage};
 pub use events::{EventHub, EventSub};
 pub use frame::Frame;
