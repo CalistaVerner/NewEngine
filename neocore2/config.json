@@ -1,27 +1,27 @@
 {
-  "config_version": 1,
-
-  "engine": {
-    "queue_capacity": 16
+  "logging": {
+    "level": "debug"
   },
 
   "window": {
-    "title": "NewEngine",
-    "width": 1600,
-	"height": 900,
+    "title": "NewEngine Editor",
+    "size": [1600, 900],
     "placement": {
       "type": "centered",
       "offset": [0, -24]
     }
   },
 
-  "render": {
-    "backend": "vulkan_ash"
+  "engine": {
+    "modules_dir": ".",
+    "assets_root": "assets",
+    "asset_pump_steps": 16,
+    "asset_filesystem_source": true
   },
 
-  "logging": {
-    "level": "info",
-    "colors": true,
-    "include_module": true
+  "render": {
+    "backend": "vulkan_ash",
+    "clear_color": [2.02, 0.22, 0.03, 1.0],
+    "debug_text": "NewEngine | Vulkan"
   }
 }

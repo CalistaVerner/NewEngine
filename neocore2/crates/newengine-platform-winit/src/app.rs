@@ -13,6 +13,12 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+#[cfg(feature = "egui")]
+use newengine_ui::draw::UiDrawList;
+
+#[cfg(feature = "egui")]
+use newengine_ui::egui_provider::EguiUi;
+
 /// Window placement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WinitWindowPlacement {
@@ -73,6 +79,9 @@ where
 
     window: Option<Window>,
     last_cursor_pos: Option<(f32, f32)>,
+
+    #[cfg(feature = "egui")]
+    ui: Option<EguiUi>,
 }
 
 impl<E, F> App<E, F>
@@ -90,14 +99,13 @@ where
             fatal: None,
             window: None,
             last_cursor_pos: None,
+            #[cfg(feature = "egui")]
+            ui: None,
         }
     }
 
     #[inline]
-    fn build_window_attributes(
-        event_loop: &ActiveEventLoop,
-        config: &WinitAppConfig,
-    ) -> WindowAttributes {
+    fn build_window_attributes(event_loop: &ActiveEventLoop, config: &WinitAppConfig) -> WindowAttributes {
         let (width, height) = config.size;
         let mut attrs = WindowAttributes::default()
             .with_title(config.title.clone())
@@ -119,10 +127,8 @@ where
                 let ms = monitor.size();
                 let mp = monitor.position();
 
-                let cx =
-                    mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
-                let cy =
-                    mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
+                let cx = mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
+                let cy = mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
 
                 attrs = attrs.with_position(PhysicalPosition::new(
                     cx.saturating_add(ox),
@@ -166,9 +172,7 @@ where
             Err(_) => return,
         };
 
-        self.engine
-            .resources_mut()
-            .insert(WinitWindowHandles { window, display });
+        self.engine.resources_mut().insert(WinitWindowHandles { window, display });
     }
 
     fn install_window_init_size_resource(&mut self) {
@@ -200,9 +204,7 @@ where
 
     #[inline]
     fn emit_focused(&mut self, focused: bool) {
-        let _ = self
-            .engine
-            .emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
+        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
     }
 
     #[inline]
@@ -322,6 +324,12 @@ where
         self.install_window_handles_resource();
         self.install_window_init_size_resource();
 
+        #[cfg(feature = "egui")]
+        {
+            let w = self.window.as_ref().unwrap();
+            self.ui = Some(EguiUi::new(w));
+        }
+
         if let Some(after) = self.after_window.take() {
             if let Err(e) = after(&mut self.engine) {
                 self.set_fatal_and_exit(event_loop, e);
@@ -342,6 +350,13 @@ where
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(feature = "egui")]
+        {
+            if let (Some(w), Some(ui)) = (self.window.as_ref(), self.ui.as_mut()) {
+                ui.input_mut().on_window_event(w, &event);
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 let _ = self
@@ -459,6 +474,23 @@ where
         if !self.started {
             self.request_redraw();
             return;
+        }
+
+        #[cfg(feature = "egui")]
+        {
+            if let (Some(w), Some(ui)) = (self.window.as_ref(), self.ui.as_mut()) {
+                let frame = ui.run_frame(w, |ctx| {
+                    egui::TopBottomPanel::top("ne_top").show(ctx, |ui| {
+                        ui.label("NewEngine UI");
+                    });
+
+                    egui::Window::new("Stats").show(ctx, |ui| {
+                        ui.label("UI online");
+                    });
+                });
+
+                self.engine.resources_mut().insert::<UiDrawList>(frame.draw_list);
+            }
         }
 
         match self.engine.step() {
