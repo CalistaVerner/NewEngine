@@ -15,10 +15,8 @@ pub fn egui_output_to_draw_list(ctx: &egui::Context, output: egui::FullOutput, o
     apply_texture_delta(&output.textures_delta, &mut out.texture_delta);
 
     let clipped_primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-
     for egui::ClippedPrimitive { clip_rect, primitive } in clipped_primitives {
         let clip = clip_rect_to_px(clip_rect, pixels_per_point);
-
         match primitive {
             egui::epaint::Primitive::Mesh(m) => push_egui_mesh(&m, clip, pixels_per_point, &mut out.mesh),
             egui::epaint::Primitive::Callback(_) => {}
@@ -26,6 +24,7 @@ pub fn egui_output_to_draw_list(ctx: &egui::Context, output: egui::FullOutput, o
     }
 }
 
+#[inline]
 fn clip_rect_to_px(r: egui::Rect, ppp: f32) -> UiRect {
     UiRect {
         min_x: (r.min.x * ppp).round(),
@@ -97,7 +96,7 @@ fn egui_texid_to_engine(id: egui::TextureId) -> UiTexId {
 fn apply_texture_delta(delta: &egui::TexturesDelta, out: &mut UiTextureDelta) {
     for (id, image_delta) in &delta.set {
         let tex_id = egui_texid_to_engine(*id);
-        let (w, h, rgba8) = image_delta_to_rgba8(&image_delta.image);
+        let (w, h, rgba8) = image_data_to_rgba8(&image_delta.image);
 
         if let Some([x, y]) = image_delta.pos {
             out.patches.push(UiTexturePatch {
@@ -116,32 +115,17 @@ fn apply_texture_delta(delta: &egui::TexturesDelta, out: &mut UiTextureDelta) {
     }
 }
 
-#[inline]
-fn f32_alpha_to_u8(a: f32) -> u8 {
-    (a.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-fn image_delta_to_rgba8(img: &egui::ImageData) -> (u32, u32, Vec<u8>) {
+fn image_data_to_rgba8(img: &egui::ImageData) -> (u32, u32, Vec<u8>) {
+    // In egui 0.33.x ImageData is a public enum with (currently) only Color.
+    // We avoid importing private paths and work against the public API surface.
     match img {
         egui::ImageData::Color(cimg) => {
             let w = cimg.size[0] as u32;
             let h = cimg.size[1] as u32;
+
             let mut rgba8 = Vec::with_capacity((w * h * 4) as usize);
-            for p in &cimg.pixels {
+            for p in cimg.pixels.iter() {
                 rgba8.extend_from_slice(&p.to_array());
-            }
-            (w, h, rgba8)
-        }
-        egui::ImageData::Font(fimg) => {
-            let w = fimg.size[0] as u32;
-            let h = fimg.size[1] as u32;
-            let mut rgba8 = Vec::with_capacity((w * h * 4) as usize);
-            for &a in &fimg.pixels {
-                let a8 = f32_alpha_to_u8(a);
-                rgba8.push(255);
-                rgba8.push(255);
-                rgba8.push(255);
-                rgba8.push(a8);
             }
             (w, h, rgba8)
         }

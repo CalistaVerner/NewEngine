@@ -51,11 +51,11 @@ impl EguiUi {
         self.input.begin_frame(window);
 
         let raw_input = self.input.take_egui_input();
-        self.ctx.begin_frame(raw_input);
+        self.ctx.begin_pass(raw_input);
 
         build(&self.ctx);
 
-        let full_output = self.ctx.end_frame();
+        let full_output = self.ctx.end_pass();
         let full_output = self.input.end_frame(window, full_output);
 
         self.draw_list.clear();
