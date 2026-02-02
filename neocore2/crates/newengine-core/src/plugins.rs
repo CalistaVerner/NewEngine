@@ -1,331 +1,468 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use abi_stable::library::RootModule;
 use abi_stable::std_types::{RResult, RString};
 use libloading::Library;
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use newengine_assets::{
+    AssetBlob, AssetError, AssetKey, AssetStore, BlobImporterDispatch, ImporterPriority,
+};
 use newengine_plugin_api::{
     Blob, CapabilityId, EventSinkV1Dyn, HostApiV1, MethodName, PluginInfo, PluginModuleDyn,
     PluginRootV1Ref, ServiceV1Dyn,
 };
 
 /* =============================================================================================
-   Plugin manager
+   Host context (services registry + asset store)
    ============================================================================================= */
 
-pub struct LoadedPlugin {
-    _path: PathBuf,
-    _lib: Library,
-    _root: PluginRootV1Ref,
-    module: PluginModuleDyn<'static>,
-    info: PluginInfo,
+pub struct HostContext {
+    services: Mutex<HashMap<String, ServiceV1Dyn<'static>>>,
+    asset_store: Arc<AssetStore>,
 }
 
-impl LoadedPlugin {
+static HOST_CTX: OnceLock<Arc<HostContext>> = OnceLock::new();
+
+pub fn init_host_context(asset_store: Arc<AssetStore>) {
+    let ctx = Arc::new(HostContext {
+        services: Mutex::new(HashMap::new()),
+        asset_store,
+    });
+    let _ = HOST_CTX.set(ctx);
+}
+
+#[inline]
+fn ctx() -> Arc<HostContext> {
+    HOST_CTX
+        .get()
+        .expect("HostContext not initialized (call init_host_context first)")
+        .clone()
+}
+
+/* =============================================================================================
+   Describe JSON contract (owned by plugin; host discovers)
+   ============================================================================================= */
+
+#[derive(Debug, Deserialize)]
+struct ServiceDescribe {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    asset_importer: Option<AssetImporterDesc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssetImporterDesc {
+    extensions: Vec<String>,
+    output_type_id: String,
+    format: String,
+    method: String,
+    #[serde(default)]
+    wire: Option<String>,
+}
+
+/* =============================================================================================
+   Service -> BlobImporterDispatch adapter
+   Calls service via HostApiV1.call_service_v1 to avoid Clone/ABI crossing.
+   Wire v1: [u32 meta_len_le][meta_json utf8][payload bytes]
+   ============================================================================================= */
+
+struct ServiceBlobImporter {
+    stable_id: Arc<str>,
+    exts: Vec<String>,
+    output_type_id: Arc<str>,
+    format: Arc<str>,
+    method: Arc<str>,
+    service_id: Arc<str>,
+}
+
+impl ServiceBlobImporter {
     #[inline]
-    pub fn info(&self) -> &PluginInfo {
-        &self.info
+    fn call_import(&self, bytes: &[u8]) -> Result<Vec<u8>, AssetError> {
+        let out: RResult<Blob, RString> = host_call_service_v1(
+            CapabilityId::from(self.service_id.as_ref()),
+            MethodName::from(self.method.as_ref()),
+            Blob::from(bytes.to_vec()),
+        );
+
+        out.into_result()
+            .map(|b| b.into_vec())
+            .map_err(|e| AssetError::new(e.to_string()))
+    }
+
+    #[inline]
+    fn unpack_wire_v1(frame: &[u8]) -> Result<(Arc<str>, Vec<u8>), AssetError> {
+        if frame.len() < 4 {
+            return Err(AssetError::new("importer wire v1: frame too small"));
+        }
+        let meta_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+
+        let need = 4usize.saturating_add(meta_len);
+        if frame.len() < need {
+            return Err(AssetError::new("importer wire v1: truncated meta"));
+        }
+
+        let meta = &frame[4..4 + meta_len];
+        let payload = frame[4 + meta_len..].to_vec();
+
+        let meta_json = std::str::from_utf8(meta)
+            .map_err(|_| AssetError::new("importer wire v1: meta is not utf8"))?
+            .to_string();
+
+        Ok((Arc::from(meta_json), payload))
     }
 }
 
+impl BlobImporterDispatch for ServiceBlobImporter {
+    fn import_blob(&self, bytes: &[u8], _key: &AssetKey) -> Result<AssetBlob, AssetError> {
+        let frame = self.call_import(bytes)?;
+        let (meta_json, payload) = Self::unpack_wire_v1(&frame)?;
+
+        Ok(AssetBlob {
+            type_id: self.output_type_id.clone(),
+            format: self.format.clone(),
+            payload,
+            meta_json,
+            dependencies: Vec::new(),
+        })
+    }
+
+    fn output_type_id(&self) -> Arc<str> {
+        self.output_type_id.clone()
+    }
+
+    fn extensions(&self) -> Vec<String> {
+        self.exts.clone()
+    }
+
+    fn priority(&self) -> ImporterPriority {
+        ImporterPriority::new(0)
+    }
+
+    fn stable_id(&self) -> Arc<str> {
+        self.stable_id.clone()
+    }
+}
+
+fn try_auto_register_importer(service_id: &str, describe_json: &str) {
+    let parsed: ServiceDescribe = match serde_json::from_str(describe_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    if parsed.kind.as_deref() != Some("asset_importer") {
+        return;
+    }
+    let Some(imp) = parsed.asset_importer else {
+        return;
+    };
+
+    // Optional guard: if plugin declares a wire string, you can enforce a known one.
+    // We keep it permissive for now.
+    let _wire = imp.wire;
+
+    let importer = ServiceBlobImporter {
+        stable_id: Arc::from(service_id.to_string()),
+        exts: imp.extensions,
+        output_type_id: Arc::from(imp.output_type_id),
+        format: Arc::from(imp.format),
+        method: Arc::from(imp.method),
+        service_id: Arc::from(service_id.to_string()),
+    };
+
+    let ctx = ctx();
+    ctx.asset_store.add_importer(Arc::new(importer));
+    log::info!(target: "assets", "importer.auto_registered service_id='{}'", service_id);
+}
+
+/* =============================================================================================
+   Host API (extern "C" ABI-safe)
+   ============================================================================================= */
+
+extern "C" fn host_log_info(s: RString) {
+    log::info!("{}", s);
+}
+
+extern "C" fn host_log_warn(s: RString) {
+    log::warn!("{}", s);
+}
+
+extern "C" fn host_log_error(s: RString) {
+    log::error!("{}", s);
+}
+
+extern "C" fn host_register_service_v1(svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
+    // Read before moving into registry; no Clone required.
+    let service_id = svc.id().to_string();
+    let describe_json = svc.describe().to_string();
+
+    let ctx = ctx();
+
+    {
+        let mut g = match ctx.services.lock() {
+            Ok(v) => v,
+            Err(_) => return RResult::RErr(RString::from("services mutex poisoned")),
+        };
+
+        if g.contains_key(&service_id) {
+            return RResult::RErr(RString::from(format!(
+                "service already registered: {}",
+                service_id
+            )));
+        }
+
+        g.insert(service_id.clone(), svc);
+    }
+
+    try_auto_register_importer(&service_id, &describe_json);
+    RResult::ROk(())
+}
+
+extern "C" fn host_call_service_v1(
+    cap_id: CapabilityId,
+    method: MethodName,
+    payload: Blob,
+) -> RResult<Blob, RString> {
+    let id = cap_id.to_string();
+    let ctx = ctx();
+
+    let g = match ctx.services.lock() {
+        Ok(v) => v,
+        Err(_) => return RResult::RErr(RString::from("services mutex poisoned")),
+    };
+
+    let svc = match g.get(&id) {
+        Some(v) => v,
+        None => return RResult::RErr(RString::from(format!("service not found: {id}"))),
+    };
+
+    svc.call(method, payload)
+}
+
+extern "C" fn host_emit_event_v1(_topic: RString, _payload: Blob) -> RResult<(), RString> {
+    RResult::ROk(())
+}
+
+extern "C" fn host_subscribe_events_v1(_sink: EventSinkV1Dyn<'static>) -> RResult<(), RString> {
+    RResult::ROk(())
+}
+
+pub fn default_host_api() -> HostApiV1 {
+    HostApiV1 {
+        log_info: host_log_info,
+        log_warn: host_log_warn,
+        log_error: host_log_error,
+
+        register_service_v1: host_register_service_v1,
+        call_service_v1: host_call_service_v1,
+
+        emit_event_v1: host_emit_event_v1,
+        subscribe_events_v1: host_subscribe_events_v1,
+    }
+}
+
+/* =============================================================================================
+   Plugin manager (DLL loader + lifecycle)
+   ============================================================================================= */
+
+#[derive(Debug)]
+pub struct PluginLoadError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl std::fmt::Display for PluginLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.message)
+    }
+}
+
+impl std::error::Error for PluginLoadError {}
+
+struct LoadedPlugin {
+    _lib: Library,
+    module: PluginModuleDyn<'static>,
+    info: PluginInfo,
+    path: PathBuf,
+}
+
 pub struct PluginManager {
-    plugins: Vec<LoadedPlugin>,
-    started: bool,
-    ids: HashSet<String>,
+    loaded: Vec<LoadedPlugin>,
 }
 
 impl PluginManager {
     #[inline]
     pub fn new() -> Self {
-        Self {
-            plugins: Vec::new(),
-            started: false,
-            ids: HashSet::new(),
-        }
+        Self { loaded: Vec::new() }
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &LoadedPlugin> {
-        self.plugins.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &PluginModuleDyn<'static>> {
+        self.loaded.iter().map(|p| &p.module)
     }
 
-    pub fn load_default(&mut self, host: HostApiV1) -> Result<(), String> {
-        let dir = modules_dir_near_exe()?;
-        self.load_dir(&dir, host)
+    pub fn load_default(&mut self, host: HostApiV1) -> Result<(), PluginLoadError> {
+        let dir = default_plugins_dir()?;
+        self.load_from_dir(&dir, host)
     }
 
-    pub fn load_dir(&mut self, dir: &Path, host: HostApiV1) -> Result<(), String> {
-        (host.log_info)(RString::from(format!(
-            "plugins: scanning directory '{}'",
-            dir.display()
-        )));
+    pub fn load_from_dir(&mut self, dir: &Path, host: HostApiV1) -> Result<(), PluginLoadError> {
+        log::info!("plugins: scanning directory '{}'", dir.display());
 
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("plugins: create_dir_all('{}') failed: {e}", dir.display()))?;
-
-        let mut libs: Vec<PathBuf> = Vec::new();
-        let rd = std::fs::read_dir(dir)
-            .map_err(|e| format!("plugins: read_dir('{}') failed: {e}", dir.display()))?;
+        let mut candidates = Vec::new();
+        let rd = std::fs::read_dir(dir).map_err(|e| PluginLoadError {
+            path: dir.to_path_buf(),
+            message: format!("read_dir failed: {e}"),
+        })?;
 
         for ent in rd {
-            let ent = ent.map_err(|e| format!("plugins: read_dir entry failed: {e}"))?;
+            let ent = ent.map_err(|e| PluginLoadError {
+                path: dir.to_path_buf(),
+                message: format!("read_dir entry failed: {e}"),
+            })?;
+
             let p = ent.path();
-            if is_dynlib(&p) {
-                libs.push(p);
+            if !is_dynamic_lib(&p) {
+                continue;
             }
+            candidates.push(p);
         }
 
-        libs.sort();
+        candidates.sort();
 
-        (host.log_info)(RString::from(format!(
-            "plugins: found {} candidate(s) in '{}'",
-            libs.len(),
-            dir.display()
-        )));
+        log::info!("plugins: found {} candidate(s) in '{}'", candidates.len(), dir.display());
 
-        let mut loaded = 0usize;
-        let mut skipped = 0usize;
-
-        for path in libs {
-            (host.log_info)(RString::from(format!(
-                "plugins: loading '{}'",
-                path.display()
-            )));
-
-            let (lib, root) = match load_root_via_libloading(&path) {
-                Ok(v) => v,
+        for path in candidates {
+            match self.load_one(&path, host.clone()) {
+                Ok(()) => {}
                 Err(e) => {
-                    skipped += 1;
-                    (host.log_warn)(RString::from(format!(
-                        "plugins: SKIP incompatible plugin file='{}': {}",
-                        path.display(),
-                        e
-                    )));
-                    continue;
+                    log::warn!("plugins: failed to load '{}': {}", path.display(), e);
                 }
-            };
-
-            let mut module = root.create()();
-            let info = module.info();
-
-            let id_key = info.id.to_string();
-            if self.ids.contains(&id_key) {
-                skipped += 1;
-                (host.log_warn)(RString::from(format!(
-                    "plugins: SKIP duplicate plugin id='{}' file='{}'",
-                    info.id,
-                    path.display()
-                )));
-                continue;
             }
-
-            if let Err(e) = module.init(host.clone()).into_result() {
-                skipped += 1;
-                (host.log_warn)(RString::from(format!(
-                    "plugins: SKIP plugin init failed id='{}' ver='{}' file='{}': {}",
-                    info.id,
-                    info.version,
-                    path.display(),
-                    e
-                )));
-                continue;
-            }
-
-            self.ids.insert(id_key);
-
-            loaded += 1;
-            (host.log_info)(RString::from(format!(
-                "plugins: loaded id='{}' ver='{}' from '{}'",
-                info.id,
-                info.version,
-                path.display()
-            )));
-
-            self.plugins.push(LoadedPlugin {
-                _path: path,
-                _lib: lib,
-                _root: root,
-                module,
-                info,
-            });
         }
-
-        (host.log_info)(RString::from(format!(
-            "plugins: load summary loaded={} skipped={}",
-            loaded, skipped
-        )));
 
         Ok(())
     }
 
     pub fn start_all(&mut self) -> Result<(), String> {
-        if self.started {
-            return Ok(());
+        for p in self.loaded.iter_mut() {
+            if let Err(e) = p.module.start().into_result() {
+                return Err(format!(
+                    "plugin '{}' start failed: {}",
+                    p.info.id, e
+                ));
+            }
         }
-
-        for p in self.plugins.iter_mut() {
-            p.module
-                .start()
-                .into_result()
-                .map_err(|e| format!("plugins: start failed for id='{}': {}", p.info.id, e))?;
-        }
-
-        self.started = true;
         Ok(())
     }
 
     pub fn fixed_update_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.plugins.iter_mut() {
-            p.module.fixed_update(dt).into_result().map_err(|e| {
-                format!("plugins: fixed_update failed for id='{}': {}", p.info.id, e)
-            })?;
+        for p in self.loaded.iter_mut() {
+            if let Err(e) = p.module.fixed_update(dt).into_result() {
+                return Err(format!(
+                    "plugin '{}' fixed_update failed: {}",
+                    p.info.id, e
+                ));
+            }
         }
         Ok(())
     }
 
     pub fn update_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.plugins.iter_mut() {
-            p.module
-                .update(dt)
-                .into_result()
-                .map_err(|e| format!("plugins: update failed for id='{}': {}", p.info.id, e))?;
+        for p in self.loaded.iter_mut() {
+            if let Err(e) = p.module.update(dt).into_result() {
+                return Err(format!("plugin '{}' update failed: {}", p.info.id, e));
+            }
         }
         Ok(())
     }
 
     pub fn render_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.plugins.iter_mut() {
-            p.module
-                .render(dt)
-                .into_result()
-                .map_err(|e| format!("plugins: render failed for id='{}': {}", p.info.id, e))?;
+        for p in self.loaded.iter_mut() {
+            if let Err(e) = p.module.render(dt).into_result() {
+                return Err(format!("plugin '{}' render failed: {}", p.info.id, e));
+            }
         }
         Ok(())
     }
 
     pub fn shutdown(&mut self) {
-        for p in self.plugins.iter_mut().rev() {
+        for p in self.loaded.iter_mut().rev() {
             p.module.shutdown();
         }
-        self.plugins.clear();
-        self.ids.clear();
-        self.started = false;
+        self.loaded.clear();
     }
-}
 
-/* =============================================================================================
-   Root loading bound to a specific DLL (no global cache)
-   ============================================================================================= */
+    fn load_one(&mut self, path: &Path, host: HostApiV1) -> Result<(), PluginLoadError> {
+        log::info!("plugins: loading '{}'", path.display());
 
-fn load_root_via_libloading(path: &Path) -> Result<(Library, PluginRootV1Ref), String> {
-    let lib = unsafe {
-        Library::new(path)
-            .map_err(|e| format!("load library failed file='{}': {e}", path.display()))?
-    };
+        let lib = unsafe { Library::new(path) }.map_err(|e| PluginLoadError {
+            path: path.to_path_buf(),
+            message: format!("Library::new failed: {e}"),
+        })?;
 
-    let name_primary = <PluginRootV1Ref as RootModule>::NAME;
-    let name_fallback = <PluginRootV1Ref as RootModule>::BASE_NAME;
+        // ABI: PluginRootV1Ref::BASE_NAME == "export_plugin_root"
+        let sym: libloading::Symbol<unsafe extern "C" fn() -> PluginRootV1Ref> =
+            unsafe { lib.get(b"export_plugin_root\0") }.map_err(|e| PluginLoadError {
+                path: path.to_path_buf(),
+                message: format!("symbol export_plugin_root not found: {e}"),
+            })?;
 
-    // Safety: we resolve function pointers from a live library handle and call them immediately.
-    unsafe {
-        if let Ok(root) = try_get_root_fn(&lib, name_primary) {
-            return Ok((lib, root));
+        let root = unsafe { sym() };
+        let mut module = root.create()();
+
+        let info = module.info();
+        if let Err(e) = module.init(host).into_result() {
+            return Err(PluginLoadError {
+                path: path.to_path_buf(),
+                message: format!("init failed: {e}"),
+            });
         }
-        if let Ok(root) = try_get_root_fn(&lib, name_fallback) {
-            return Ok((lib, root));
-        }
-    }
 
-    Err(format!(
-        "missing root symbol '{}' (or '{}') in '{}': GetProcAddress failed",
-        name_primary,
-        name_fallback,
-        path.display()
-    ))
-}
+        log::info!(
+            "plugins: loaded id='{}' ver='{}' from '{}'",
+            info.id,
+            info.version,
+            path.display()
+        );
 
-unsafe fn try_get_root_fn(lib: &Library, sym_name: &str) -> Result<PluginRootV1Ref, ()> {
-    let mut bytes = Vec::with_capacity(sym_name.len() + 1);
-    bytes.extend_from_slice(sym_name.as_bytes());
-    bytes.push(0);
+        self.loaded.push(LoadedPlugin {
+            _lib: lib,
+            module,
+            info,
+            path: path.to_path_buf(),
+        });
 
-    let sym = unsafe {
-        lib.get::<unsafe extern "C" fn() -> PluginRootV1Ref>(&bytes)
-            .map_err(|_| ())?
-    };
-
-    let get_root: unsafe extern "C" fn() -> PluginRootV1Ref = *sym;
-
-    // End the borrow of `lib` before calling/returning anything.
-    drop(sym);
-
-    let root = unsafe { get_root() };
-    Ok(root)
-}
-
-/* =============================================================================================
-   Helpers
-   ============================================================================================= */
-
-#[inline]
-fn is_dynlib(p: &Path) -> bool {
-    let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    matches!(ext.to_ascii_lowercase().as_str(), "dll" | "so" | "dylib")
-}
-
-#[inline]
-pub fn default_host_api() -> HostApiV1 {
-    extern "C" fn log_info(msg: RString) {
-        log::info!("{}", msg);
-    }
-
-    extern "C" fn log_warn(msg: RString) {
-        log::warn!("{}", msg);
-    }
-
-    extern "C" fn log_error(msg: RString) {
-        log::error!("{}", msg);
-    }
-
-    extern "C" fn register_service_v1(_svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
-        RResult::ROk(())
-    }
-
-    extern "C" fn call_service_v1(
-        _id: CapabilityId,
-        _method: MethodName,
-        _payload: Blob,
-    ) -> RResult<Blob, RString> {
-        RResult::RErr(RString::from("service not found"))
-    }
-
-    extern "C" fn emit_event_v1(_topic: RString, _payload: Blob) -> RResult<(), RString> {
-        RResult::ROk(())
-    }
-
-    extern "C" fn subscribe_events_v1(_sink: EventSinkV1Dyn<'static>) -> RResult<(), RString> {
-        RResult::ROk(())
-    }
-
-    HostApiV1 {
-        log_info,
-        log_warn,
-        log_error,
-        register_service_v1,
-        call_service_v1,
-        emit_event_v1,
-        subscribe_events_v1,
+        Ok(())
     }
 }
 
-pub fn modules_dir_near_exe() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let base = exe
+fn is_dynamic_lib(p: &Path) -> bool {
+    match p.extension().and_then(OsStr::to_str) {
+        Some("dll") => true,
+        Some("so") => true,
+        Some("dylib") => true,
+        _ => false,
+    }
+}
+
+fn default_plugins_dir() -> Result<PathBuf, PluginLoadError> {
+    let exe = std::env::current_exe().map_err(|e| PluginLoadError {
+        path: PathBuf::new(),
+        message: format!("current_exe failed: {e}"),
+    })?;
+
+    let dir = exe
         .parent()
-        .ok_or_else(|| "current_exe has no parent directory".to_string())?;
-    Ok(base.to_path_buf())
+        .ok_or_else(|| PluginLoadError {
+            path: exe.clone(),
+            message: "current_exe has no parent".to_string(),
+        })?
+        .to_path_buf();
+
+    Ok(dir)
 }

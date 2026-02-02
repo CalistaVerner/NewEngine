@@ -2,7 +2,7 @@ use crate::error::{EngineError, EngineResult, ModuleStage};
 use crate::events::EventHub;
 use crate::frame::Frame;
 use crate::module::{ApiVersion, Bus, Module, ModuleCtx, Resources, Services};
-use crate::plugins::{PluginManager, default_host_api};
+use crate::plugins::{default_host_api, init_host_context, PluginManager};
 use crate::sched::Scheduler;
 use crate::sync::ShutdownToken;
 use crate::system_info::SystemInfo;
@@ -39,7 +39,7 @@ pub struct Engine<E: Send + 'static> {
 #[derive(Copy, Clone, Debug)]
 struct Elapsed {
     value: u128,
-    unit: &'static str, // "us" | "ms"
+    unit: &'static str,
 }
 
 impl Elapsed {
@@ -47,10 +47,7 @@ impl Elapsed {
     fn from_duration(d: Duration) -> Self {
         let us = d.as_micros();
         if us < 1000 {
-            Self {
-                value: us,
-                unit: "us",
-            }
+            Self { value: us, unit: "us" }
         } else {
             Self {
                 value: d.as_millis(),
@@ -110,6 +107,14 @@ impl<E: Send + 'static> Engine<E> {
 
         resources.insert(asset_manager);
 
+        // NEW: host context must exist before any plugin can register services/importers
+        let asset_store = resources
+            .get::<crate::assets::AssetManager>()
+            .expect("AssetManager missing")
+            .store()
+            .clone();
+        init_host_context(asset_store);
+
         Ok(Self {
             fixed_dt,
             services,
@@ -135,8 +140,6 @@ impl<E: Send + 'static> Engine<E> {
         })
     }
 
-
-
     #[inline]
     pub fn resources_mut(&mut self) -> &mut Resources {
         &mut self.resources
@@ -152,9 +155,7 @@ impl<E: Send + 'static> Engine<E> {
 
         let id = module.id();
         if self.module_ids.contains(id) {
-            return Err(EngineError::Other(format!(
-                "module already registered: {id}"
-            )));
+            return Err(EngineError::Other(format!("module already registered: {id}")));
         }
 
         self.modules.push(module);
@@ -176,12 +177,7 @@ impl<E: Send + 'static> Engine<E> {
     }
 
     #[inline]
-    fn log_phase_ok(
-        scope: &'static str,
-        phase: &'static str,
-        count: Option<usize>,
-        elapsed: Elapsed,
-    ) {
+    fn log_phase_ok(scope: &'static str, phase: &'static str, count: Option<usize>, elapsed: Elapsed) {
         match count {
             Some(n) => log::info!("{scope}: done (phase={phase} count={n} {elapsed})"),
             None => log::info!("{scope}: done (phase={phase} {elapsed})"),
@@ -212,16 +208,16 @@ impl<E: Send + 'static> Engine<E> {
                 Self::elapsed_since(t0),
                 e
             );
-            // do not fail engine startup
         }
         self.plugins_loaded = true;
 
         let loaded = self.plugins.iter().count();
         Self::log_phase_ok("plugins", phase, Some(loaded), Self::elapsed_since(t0));
+
         Ok(())
     }
 
-    pub fn start(&mut self) -> EngineResult<()> {
+pub fn start(&mut self) -> EngineResult<()> {
         self.started = true;
         self.last = Instant::now();
         self.sync_shutdown_state();
