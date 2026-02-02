@@ -10,19 +10,31 @@ use newengine_platform_winit::{WinitWindowHandles, WinitWindowInitSize};
 use crate::error::VkRenderError;
 use crate::render_api::VulkanRenderApi;
 
+#[derive(Debug, Clone)]
+pub struct VulkanRenderConfig {
+    pub clear_color: [f32; 4],
+    pub debug_text: Option<String>,
+}
+
+impl Default for VulkanRenderConfig {
+    fn default() -> Self {
+        Self {
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            debug_text: None,
+        }
+    }
+}
+
 pub struct VulkanAshRenderModule {
     api: Option<RenderApiRef>,
     last_w: u32,
     last_h: u32,
+    config: VulkanRenderConfig,
 }
 
 impl Default for VulkanAshRenderModule {
     fn default() -> Self {
-        Self {
-            api: None,
-            last_w: 0,
-            last_h: 0,
-        }
+        Self::new(VulkanRenderConfig::default())
     }
 }
 
@@ -53,7 +65,12 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
         let renderer = unsafe { vulkan::VulkanRenderer::new(display, window, w, h) }
             .map_err(|e| EngineError::other(e.to_string()))?;
 
-        let api = RenderApiRef::new(VulkanRenderApi::new(renderer, w, h));
+        let api = RenderApiRef::new(VulkanRenderApi::new(
+            renderer,
+            w,
+            h,
+            self.config.debug_text.clone(),
+        ));
 
         ctx.resources_mut().register_api(RENDER_API_ID, api.clone())?;
 
@@ -83,7 +100,7 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
 
         {
             let mut r = api.lock();
-            r.begin_frame(BeginFrameDesc::new([0.0, 0.0, 0.0, 1.0]))?;
+            r.begin_frame(BeginFrameDesc::new(self.config.clear_color))?;
             r.end_frame()?;
         }
 
@@ -96,5 +113,17 @@ impl<E: Send + 'static> Module<E> for VulkanAshRenderModule {
             .unregister_api::<RenderApiRef>(RENDER_API_ID);
         self.api = None;
         Ok(())
+    }
+}
+
+impl VulkanAshRenderModule {
+    #[inline]
+    pub fn new(config: VulkanRenderConfig) -> Self {
+        Self {
+            api: None,
+            last_w: 0,
+            last_h: 0,
+            config,
+        }
     }
 }

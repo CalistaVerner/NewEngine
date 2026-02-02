@@ -6,6 +6,36 @@ use newengine_assets::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[derive(Debug, Clone)]
+pub struct AssetManagerConfig {
+    pub root: PathBuf,
+    pub pump_steps: u32,
+    pub enable_filesystem_source: bool,
+}
+
+impl AssetManagerConfig {
+    #[inline]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            pump_steps: 8,
+            enable_filesystem_source: true,
+        }
+    }
+
+    #[inline]
+    pub fn with_pump_steps(mut self, steps: u32) -> Self {
+        self.pump_steps = steps;
+        self
+    }
+
+    #[inline]
+    pub fn with_filesystem_source(mut self, enabled: bool) -> Self {
+        self.enable_filesystem_source = enabled;
+        self
+    }
+}
+
 pub struct AssetManager {
     store: Arc<AssetStore>,
     budget: PumpBudget,
@@ -14,18 +44,26 @@ pub struct AssetManager {
 impl AssetManager {
     #[inline]
     pub fn new_default(root: PathBuf) -> Self {
-        info!(target: "assets", "manager.init root='{}'", root.display());
+        Self::new_with_config(AssetManagerConfig::new(root))
+    }
+
+    #[inline]
+    pub fn new_with_config(config: AssetManagerConfig) -> Self {
+        info!(target: "assets", "manager.init root='{}'", config.root.display());
 
         let store = Arc::new(AssetStore::new());
 
-        info!(
-            target: "assets",
-            "manager.source.register kind='filesystem' root='{}'",
-            root.display()
-        );
-        store.add_source(Arc::new(FileSystemSource::new(root)));
+        if config.enable_filesystem_source {
+            info!(
+                target: "assets",
+                "manager.source.register kind='filesystem' root='{}'",
+                config.root.display()
+            );
+            store.add_source(Arc::new(FileSystemSource::new(config.root)));
+        }
 
-        let budget = PumpBudget::steps(8);
+        let steps = config.pump_steps.max(1);
+        let budget = PumpBudget::steps(steps);
         info!(target: "assets", "manager.budget steps={}", budget.steps);
 
         Self { store, budget }

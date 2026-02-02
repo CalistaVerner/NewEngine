@@ -6,11 +6,37 @@ use crate::plugins::{default_host_api, init_host_context, PluginManager};
 use crate::sched::Scheduler;
 use crate::sync::ShutdownToken;
 use crate::system_info::SystemInfo;
+use crate::AssetManagerConfig;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub fixed_dt_ms: u32,
+    pub assets: AssetManagerConfig,
+    pub plugins_dir: Option<PathBuf>,
+}
+
+impl EngineConfig {
+    #[inline]
+    pub fn new(fixed_dt_ms: u32, assets: AssetManagerConfig) -> Self {
+        Self {
+            fixed_dt_ms,
+            assets,
+            plugins_dir: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_plugins_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.plugins_dir = dir;
+        self
+    }
+}
 
 pub struct Engine<E: Send + 'static> {
     fixed_dt: f32,
@@ -25,6 +51,7 @@ pub struct Engine<E: Send + 'static> {
 
     plugins: PluginManager,
     plugins_loaded: bool,
+    plugins_dir: Option<PathBuf>,
 
     shutdown: ShutdownToken,
     exit_requested: bool,
@@ -94,20 +121,26 @@ impl<E: Send + 'static> Engine<E> {
         bus: Bus<E>,
         shutdown: ShutdownToken,
     ) -> EngineResult<Self> {
-        let fixed_dt = (fixed_dt_ms as f32 / 1000.0).max(0.001);
-
-        let mut resources = Resources::default();
-
         let assets_root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join("assets");
+        let config = EngineConfig::new(fixed_dt_ms, AssetManagerConfig::new(assets_root));
+        Self::new_with_config(config, services, bus, shutdown)
+    }
 
-        let mut asset_manager = crate::assets::AssetManager::new_default(assets_root);
-        asset_manager.set_budget(8);
+    pub fn new_with_config(
+        config: EngineConfig,
+        services: Box<dyn Services>,
+        bus: Bus<E>,
+        shutdown: ShutdownToken,
+    ) -> EngineResult<Self> {
+        let fixed_dt = (config.fixed_dt_ms as f32 / 1000.0).max(0.001);
 
+        let mut resources = Resources::default();
+        let asset_manager = crate::assets::AssetManager::new_with_config(config.assets);
         resources.insert(asset_manager);
 
-        // NEW: host context must exist before any plugin can register services/importers
+        // Host context must exist before any plugin can register services/importers.
         let asset_store = resources
             .get::<crate::assets::AssetManager>()
             .expect("AssetManager missing")
@@ -128,6 +161,7 @@ impl<E: Send + 'static> Engine<E> {
 
             plugins: PluginManager::new(),
             plugins_loaded: false,
+            plugins_dir: config.plugins_dir,
 
             shutdown,
             exit_requested: false,
@@ -201,7 +235,13 @@ impl<E: Send + 'static> Engine<E> {
 
         let host = default_host_api();
 
-        if let Err(e) = self.plugins.load_default(host) {
+        let load_result = if let Some(dir) = self.plugins_dir.as_deref() {
+            self.plugins.load_from_dir(dir, host)
+        } else {
+            self.plugins.load_default(host)
+        };
+
+        if let Err(e) = load_result {
             log::warn!(
                 "plugins: non-fatal load error (phase={} {}): {}",
                 phase,
