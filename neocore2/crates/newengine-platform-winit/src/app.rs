@@ -1,6 +1,7 @@
 use newengine_core::host_events::{
     HostEvent, InputHostEvent, KeyCode, KeyState, MouseButton, TextHostEvent, WindowHostEvent,
 };
+use newengine_core::startup::UiBackend;
 use newengine_core::{Engine, EngineError, EngineResult};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::{
@@ -13,11 +14,9 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-#[cfg(feature = "egui")]
 use newengine_ui::draw::UiDrawList;
-
-#[cfg(feature = "egui")]
-use newengine_ui::egui_provider::EguiUi;
+use newengine_ui::{create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions};
+use std::any::Any;
 
 /// Window placement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +36,10 @@ pub struct WinitAppConfig {
     pub title: String,
     pub size: (u32, u32),
     pub placement: WinitWindowPlacement,
+
+    /// UI backend selection (boot-time).
+    /// Default is `UiBackend::Egui` so UI works without any args.
+    pub ui_backend: UiBackend,
 }
 
 impl Default for WinitAppConfig {
@@ -46,6 +49,7 @@ impl Default for WinitAppConfig {
             title: "NewEngine".to_owned(),
             size: (1280, 720),
             placement: WinitWindowPlacement::Centered { offset: (0, 0) },
+            ui_backend: UiBackend::Egui,
         }
     }
 }
@@ -66,6 +70,24 @@ pub struct WinitWindowInitSize {
     pub height: u32,
 }
 
+struct EditorUiBuild;
+
+impl UiBuildFn for EditorUiBuild {
+    fn build(&mut self, ctx_any: &mut dyn Any) {
+        let Some(ctx) = ctx_any.downcast_mut::<egui::Context>() else {
+            return;
+        };
+
+        egui::TopBottomPanel::top("ne_top").show(ctx, |ui| {
+            ui.label("NewEngine UI");
+        });
+
+        egui::Window::new("Stats").show(ctx, |ui| {
+            ui.label("UI online");
+        });
+    }
+}
+
 struct App<E, F>
 where
     E: Send + 'static,
@@ -80,8 +102,7 @@ where
     window: Option<Window>,
     last_cursor_pos: Option<(f32, f32)>,
 
-    #[cfg(feature = "egui")]
-    ui: Option<EguiUi>,
+    ui: Box<dyn UiProvider>,
 }
 
 impl<E, F> App<E, F>
@@ -90,7 +111,24 @@ where
     F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
 {
     #[inline]
+    fn map_ui_backend_to_provider_kind(ui: &UiBackend) -> UiProviderKind {
+        match ui {
+            UiBackend::Egui => UiProviderKind::Egui,
+            UiBackend::Disabled => UiProviderKind::Null,
+            UiBackend::Custom(_) => UiProviderKind::Null,
+        }
+    }
+
+    #[inline]
     fn new(engine: Engine<E>, config: WinitAppConfig, after_window: F) -> Self {
+        let kind = Self::map_ui_backend_to_provider_kind(&config.ui_backend);
+
+        if let UiBackend::Custom(name) = &config.ui_backend {
+            log::warn!("ui backend '{}' is not supported by this host; falling back to Null", name);
+        }
+
+        let ui = create_provider(UiProviderOptions { kind });
+
         Self {
             engine,
             after_window: Some(after_window),
@@ -99,8 +137,7 @@ where
             fatal: None,
             window: None,
             last_cursor_pos: None,
-            #[cfg(feature = "egui")]
-            ui: None,
+            ui,
         }
     }
 
@@ -179,9 +216,7 @@ where
         let Some((width, height)) = self.window_size() else {
             return;
         };
-        self.engine
-            .resources_mut()
-            .insert(WinitWindowInitSize { width, height });
+        self.engine.resources_mut().insert(WinitWindowInitSize { width, height });
     }
 
     fn emit_ready(&mut self) {
@@ -197,9 +232,7 @@ where
 
     #[inline]
     fn emit_resized(&mut self, width: u32, height: u32) {
-        let _ = self
-            .engine
-            .emit(HostEvent::Window(WindowHostEvent::Resized { width, height }));
+        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Resized { width, height }));
     }
 
     #[inline]
@@ -320,15 +353,8 @@ where
 
         self.window = Some(window);
 
-        // Insert raw handles + initial size BEFORE registering modules and engine.start()
         self.install_window_handles_resource();
         self.install_window_init_size_resource();
-
-        #[cfg(feature = "egui")]
-        {
-            let w = self.window.as_ref().unwrap();
-            self.ui = Some(EguiUi::new(w));
-        }
 
         if let Some(after) = self.after_window.take() {
             if let Err(e) = after(&mut self.engine) {
@@ -350,18 +376,13 @@ where
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        #[cfg(feature = "egui")]
-        {
-            if let (Some(w), Some(ui)) = (self.window.as_ref(), self.ui.as_mut()) {
-                ui.input_mut().on_window_event(w, &event);
-            }
+        if let Some(w) = self.window.as_ref() {
+            self.ui.on_platform_event(w, &event);
         }
 
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Window(WindowHostEvent::CloseRequested));
+                let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::CloseRequested));
                 Self::exit(event_loop);
                 return;
             }
@@ -410,12 +431,10 @@ where
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseButton {
-                        button: Self::map_mouse_button(button),
-                        state: Self::map_state(state),
-                    }));
+                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseButton {
+                    button: Self::map_mouse_button(button),
+                    state: Self::map_state(state),
+                }));
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -423,38 +442,28 @@ where
                     MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
+                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 if let Some((px, py)) = self.last_cursor_pos {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Input(InputHostEvent::MouseDelta {
-                            dx: x - px,
-                            dy: y - py,
-                        }));
+                    let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseDelta {
+                        dx: x - px,
+                        dy: y - py,
+                    }));
                 }
                 self.last_cursor_pos = Some((x, y));
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
+                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
             }
 
             WindowEvent::Ime(ime) => match ime {
                 Ime::Commit(text) => {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
+                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
                 }
                 Ime::Preedit(text, _) => {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
+                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
                 }
                 Ime::Enabled => {}
                 Ime::Disabled => {}
@@ -476,21 +485,10 @@ where
             return;
         }
 
-        #[cfg(feature = "egui")]
-        {
-            if let (Some(w), Some(ui)) = (self.window.as_ref(), self.ui.as_mut()) {
-                let frame = ui.run_frame(w, |ctx| {
-                    egui::TopBottomPanel::top("ne_top").show(ctx, |ui| {
-                        ui.label("NewEngine UI");
-                    });
-
-                    egui::Window::new("Stats").show(ctx, |ui| {
-                        ui.label("UI online");
-                    });
-                });
-
-                self.engine.resources_mut().insert::<UiDrawList>(frame.draw_list);
-            }
+        if let Some(w) = self.window.as_ref() {
+            let mut build = EditorUiBuild;
+            let out = self.ui.run_frame(w, UiFrameDesc::new(0.0), &mut build);
+            self.engine.resources_mut().insert::<UiDrawList>(out.draw_list);
         }
 
         match self.engine.step() {
@@ -505,8 +503,6 @@ where
 }
 
 /// Runs winit host and starts the engine *after* the window is created.
-/// `after_window` is called once, right after inserting `WinitWindowHandles` + `WinitWindowInitSize` into Resources.
-/// Use it to register modules that require window handles (Vulkan, CEF, etc.).
 pub fn run_winit_app<E, F>(engine: Engine<E>, after_window: F) -> EngineResult<()>
 where
     E: Send + 'static,
@@ -516,9 +512,6 @@ where
 }
 
 /// Runs winit host with the provided window configuration and starts the engine *after* the window is created.
-///
-/// `after_window` is called once, right after inserting `WinitWindowHandles` + `WinitWindowInitSize` into Resources.
-/// Use it to register modules that require window handles (Vulkan, CEF, etc.).
 pub fn run_winit_app_with_config<E, F>(
     engine: Engine<E>,
     config: WinitAppConfig,
