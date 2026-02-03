@@ -1,188 +1,55 @@
 use crate::error::VkResult;
 
 use ash::vk;
-use std::collections::HashMap;
 use std::mem;
 use std::ptr;
 
-use super::device::*;
-use super::pipeline::create_shader_module;
-use super::util::*;
-use super::VulkanRenderer;
+use super::super::device::*;
+use super::super::util::*;
+use super::super::VulkanRenderer;
 
-use newengine_ui::draw::{UiDrawCmd, UiDrawList, UiTexId, UiTextureDelta, UiVertex};
+use newengine_ui::draw::{UiDrawCmd, UiDrawList, UiTexId, UiTextureDelta};
+
+use super::pipeline::{create_ui_pipeline, ui_pc_bytes};
 
 #[derive(Clone, Copy)]
 pub(crate) struct GpuUiTexture {
-    image: vk::Image,
-    mem: vk::DeviceMemory,
-    view: vk::ImageView,
-    desc_set: vk::DescriptorSet,
-    size: [u32; 2],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UiPc {
-    screen_size: [f32; 2],
-    _pad: [f32; 2],
-}
-
-pub(super) unsafe fn create_ui_pipeline(
-    device: &ash::Device,
-    render_pass: vk::RenderPass,
-    set_layout: vk::DescriptorSetLayout,
-) -> VkResult<(vk::PipelineLayout, vk::Pipeline)> {
-    let vert = create_shader_module(
-        device,
-        include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv")),
-    )?;
-    let frag = create_shader_module(
-        device,
-        include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv")),
-    )?;
-
-    let entry = std::ffi::CString::new("main").unwrap();
-
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert)
-            .name(&entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag)
-            .name(&entry),
-    ];
-
-    let binding = vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(mem::size_of::<UiVertex>() as u32)
-        .input_rate(vk::VertexInputRate::VERTEX);
-
-    let attrs = [
-        vk::VertexInputAttributeDescription::default()
-            .location(0)
-            .binding(0)
-            .format(vk::Format::R32G32_SFLOAT)
-            .offset(0),
-        vk::VertexInputAttributeDescription::default()
-            .location(1)
-            .binding(0)
-            .format(vk::Format::R32G32_SFLOAT)
-            .offset(8),
-        vk::VertexInputAttributeDescription::default()
-            .location(2)
-            .binding(0)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .offset(16),
-    ];
-
-    let vi = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_binding_descriptions(std::slice::from_ref(&binding))
-        .vertex_attribute_descriptions(&attrs);
-
-    let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-
-    let vp = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
-    let rs = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0);
-
-    let ms = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-    let ca = vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .alpha_blend_op(vk::BlendOp::ADD)
-        .color_write_mask(
-            vk::ColorComponentFlags::R
-                | vk::ColorComponentFlags::G
-                | vk::ColorComponentFlags::B
-                | vk::ColorComponentFlags::A,
-        );
-
-    let cb = vk::PipelineColorBlendStateCreateInfo::default()
-        .attachments(std::slice::from_ref(&ca));
-
-    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let ds = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-
-    let push_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::VERTEX)
-        .offset(0)
-        .size(mem::size_of::<UiPc>() as u32)];
-
-    let set_layouts = [set_layout];
-    let layout = device.create_pipeline_layout(
-        &vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_ranges),
-        None,
-    )?;
-
-    let gp = vk::GraphicsPipelineCreateInfo::default()
-        .stages(&stages)
-        .vertex_input_state(&vi)
-        .input_assembly_state(&ia)
-        .viewport_state(&vp)
-        .rasterization_state(&rs)
-        .multisample_state(&ms)
-        .color_blend_state(&cb)
-        .dynamic_state(&ds)
-        .layout(layout)
-        .render_pass(render_pass)
-        .subpass(0);
-
-    let pipelines = device.create_graphics_pipelines(vk::PipelineCache::null(), &[gp], None);
-    let pipeline = match pipelines {
-        Ok(v) => v[0],
-        Err((_, e)) => return Err(e.into()),
-    };
-
-    device.destroy_shader_module(vert, None);
-    device.destroy_shader_module(frag, None);
-
-    Ok((layout, pipeline))
+    pub(crate) image: vk::Image,
+    pub(crate) mem: vk::DeviceMemory,
+    pub(crate) view: vk::ImageView,
+    pub(crate) desc_set: vk::DescriptorSet,
+    pub(crate) size: [u32; 2],
 }
 
 impl VulkanRenderer {
-    pub(super) fn init_ui_overlay(&mut self) -> VkResult<()> {
+    pub(crate) fn init_ui_overlay(&mut self) -> VkResult<()> {
         unsafe {
             self.create_ui_descriptor()?;
-            let (pl, p) = create_ui_pipeline(&self.device, self.render_pass, self.ui_desc_set_layout)?;
+            let (pl, p) =
+                create_ui_pipeline(&self.device, self.render_pass, self.ui_desc_set_layout)?;
             self.ui_pipeline_layout = pl;
             self.ui_pipeline = p;
         }
         Ok(())
     }
 
-    pub(super) unsafe fn destroy_ui_overlay(&mut self) {
+    pub(crate) unsafe fn destroy_ui_overlay(&mut self) {
         self.destroy_ui_resources();
 
         if self.ui_pipeline != vk::Pipeline::null() {
             self.device.destroy_pipeline(self.ui_pipeline, None);
         }
         if self.ui_pipeline_layout != vk::PipelineLayout::null() {
-            self.device.destroy_pipeline_layout(self.ui_pipeline_layout, None);
+            self.device
+                .destroy_pipeline_layout(self.ui_pipeline_layout, None);
         }
 
         if self.ui_desc_pool != vk::DescriptorPool::null() {
             self.device.destroy_descriptor_pool(self.ui_desc_pool, None);
         }
         if self.ui_desc_set_layout != vk::DescriptorSetLayout::null() {
-            self.device.destroy_descriptor_set_layout(self.ui_desc_set_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.ui_desc_set_layout, None);
         }
         if self.ui_sampler != vk::Sampler::null() {
             self.device.destroy_sampler(self.ui_sampler, None);
@@ -300,10 +167,10 @@ impl VulkanRenderer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        let mapped = self
-            .device
-            .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
-            as *mut u8;
+        let mapped =
+            self.device
+                .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
+                as *mut u8;
         ptr::copy_nonoverlapping(rgba8.as_ptr(), mapped, rgba8.len());
         self.device.unmap_memory(staging_mem);
 
@@ -420,7 +287,8 @@ impl VulkanRenderer {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&image_info));
 
-        self.device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+        self.device
+            .update_descriptor_sets(std::slice::from_ref(&write), &[]);
 
         self.ui_textures.insert(
             id.0,
@@ -463,10 +331,10 @@ impl VulkanRenderer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        let mapped = self
-            .device
-            .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
-            as *mut u8;
+        let mapped =
+            self.device
+                .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
+                as *mut u8;
         ptr::copy_nonoverlapping(rgba8.as_ptr(), mapped, rgba8.len());
         self.device.unmap_memory(staging_mem);
 
@@ -524,7 +392,11 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    pub(super) unsafe fn ui_ensure_buffers(&mut self, vb_bytes: vk::DeviceSize, ib_bytes: vk::DeviceSize) -> VkResult<()> {
+    pub(super) unsafe fn ui_ensure_buffers(
+        &mut self,
+        vb_bytes: vk::DeviceSize,
+        ib_bytes: vk::DeviceSize,
+    ) -> VkResult<()> {
         if self.ui_vb == vk::Buffer::null() || vb_bytes > self.ui_vb_size {
             if self.ui_vb != vk::Buffer::null() {
                 self.device.destroy_buffer(self.ui_vb, None);
@@ -570,54 +442,70 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    pub(super) unsafe fn ui_upload_and_draw(&mut self, cmd: vk::CommandBuffer, list: &UiDrawList) -> VkResult<()> {
+    pub(crate) unsafe fn ui_upload_and_draw(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        list: &UiDrawList,
+    ) -> VkResult<()> {
         self.ui_apply_delta(&list.texture_delta)?;
 
-        let vb_bytes = (mem::size_of::<UiVertex>() * list.mesh.vertices.len()) as vk::DeviceSize;
+        let vb_bytes = (mem::size_of::<newengine_ui::draw::UiVertex>() * list.mesh.vertices.len())
+            as vk::DeviceSize;
         let ib_bytes = (mem::size_of::<u32>() * list.mesh.indices.len()) as vk::DeviceSize;
 
         self.ui_ensure_buffers(vb_bytes, ib_bytes)?;
 
         if !list.mesh.vertices.is_empty() {
-            let mapped = self.device.map_memory(self.ui_vb_mem, 0, vb_bytes, vk::MemoryMapFlags::empty())? as *mut u8;
-            ptr::copy_nonoverlapping(list.mesh.vertices.as_ptr() as *const u8, mapped, vb_bytes as usize);
+            let mapped =
+                self.device
+                    .map_memory(self.ui_vb_mem, 0, vb_bytes, vk::MemoryMapFlags::empty())?
+                    as *mut u8;
+            ptr::copy_nonoverlapping(
+                list.mesh.vertices.as_ptr() as *const u8,
+                mapped,
+                vb_bytes as usize,
+            );
             self.device.unmap_memory(self.ui_vb_mem);
         }
 
         if !list.mesh.indices.is_empty() {
-            let mapped = self.device.map_memory(self.ui_ib_mem, 0, ib_bytes, vk::MemoryMapFlags::empty())? as *mut u8;
-            ptr::copy_nonoverlapping(list.mesh.indices.as_ptr() as *const u8, mapped, ib_bytes as usize);
+            let mapped =
+                self.device
+                    .map_memory(self.ui_ib_mem, 0, ib_bytes, vk::MemoryMapFlags::empty())?
+                    as *mut u8;
+            ptr::copy_nonoverlapping(
+                list.mesh.indices.as_ptr() as *const u8,
+                mapped,
+                ib_bytes as usize,
+            );
             self.device.unmap_memory(self.ui_ib_mem);
         }
 
-        if list.mesh.indices.is_empty() || list.mesh.vertices.is_empty() || list.mesh.cmds.is_empty() {
+        if list.mesh.indices.is_empty()
+            || list.mesh.vertices.is_empty()
+            || list.mesh.cmds.is_empty()
+        {
             return Ok(());
         }
 
-        self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ui_pipeline);
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ui_pipeline);
 
-        let pc = UiPc {
-            screen_size: [list.screen_size_px[0] as f32, list.screen_size_px[1] as f32],
-            _pad: [0.0, 0.0],
-        };
-
-        let pc_bytes: &[u8] = std::slice::from_raw_parts(
-            (&pc as *const UiPc) as *const u8,
-            mem::size_of::<UiPc>(),
-        );
+        let pc = ui_pc_bytes(list.screen_size_px);
 
         self.device.cmd_push_constants(
             cmd,
             self.ui_pipeline_layout,
             vk::ShaderStageFlags::VERTEX,
             0,
-            pc_bytes,
+            &pc,
         );
 
         let vb = [self.ui_vb];
         let offsets = [0u64];
         self.device.cmd_bind_vertex_buffers(cmd, 0, &vb, &offsets);
-        self.device.cmd_bind_index_buffer(cmd, self.ui_ib, 0, vk::IndexType::UINT32);
+        self.device
+            .cmd_bind_index_buffer(cmd, self.ui_ib, 0, vk::IndexType::UINT32);
 
         for c in &list.mesh.cmds {
             self.ui_draw_cmd(cmd, c)?;
@@ -653,7 +541,8 @@ impl VulkanRenderer {
             },
         };
 
-        self.device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
+        self.device
+            .cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
 
         self.device.cmd_bind_descriptor_sets(
             cmd,
@@ -671,7 +560,8 @@ impl VulkanRenderer {
             return Ok(());
         }
 
-        self.device.cmd_draw_indexed(cmd, index_count, 1, first_index, 0, 0);
+        self.device
+            .cmd_draw_indexed(cmd, index_count, 1, first_index, 0, 0);
         Ok(())
     }
 }

@@ -1,43 +1,52 @@
-use ash::vk;
-use ash::Device;
+use crate::error::VkResult;
 
-pub(super) fn stage_access_for_layout(
-    layout: vk::ImageLayout,
-) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+use ash::vk;
+
+/// Picks conservative stage+access masks for a given layout.
+/// This is not exhaustive, but covers our engine's usage.
+#[inline]
+fn stage_access_for_layout(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
     match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty()),
+        vk::ImageLayout::UNDEFINED => (
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+        ),
+
         vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
             vk::PipelineStageFlags::TRANSFER,
             vk::AccessFlags::TRANSFER_WRITE,
         ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::SHADER_READ,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_READ,
         ),
+
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         ),
+
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        ),
+
         vk::ImageLayout::PRESENT_SRC_KHR => (
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             vk::AccessFlags::empty(),
         ),
-        _ => (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE),
+
+        _ => (
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        ),
     }
 }
 
-pub(super) fn transition_image(
-    device: &Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    transition_image_layout(device, cmd, image, old_layout, new_layout);
-}
-
-pub(super) fn transition_image_layout(
-    device: &Device,
+/// Generic barrier helper. Critical: queue family indices MUST be IGNORED unless ownership transfer is intended.
+#[inline]
+pub unsafe fn transition_image_layout(
+    device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
     old_layout: vk::ImageLayout,
@@ -55,6 +64,8 @@ pub(super) fn transition_image_layout(
         .dst_access_mask(dst_access)
         .old_layout(old_layout)
         .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(
             vk::ImageSubresourceRange::default()
@@ -65,52 +76,57 @@ pub(super) fn transition_image_layout(
                 .layer_count(1),
         );
 
-    unsafe {
-        device.cmd_pipeline_barrier(
-            cmd,
-            src_stage,
-            dst_stage,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            std::slice::from_ref(&barrier),
-        );
-    }
+    device.cmd_pipeline_barrier(
+        cmd,
+        src_stage,
+        dst_stage,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        std::slice::from_ref(&barrier),
+    );
 }
 
-pub(super) fn immediate_submit<F>(
-    device: &Device,
+/// Alias used by the swapchain path (kept for readability).
+#[inline]
+pub unsafe fn transition_image(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) {
+    transition_image_layout(device, cmd, image, old_layout, new_layout);
+}
+
+/// One-shot submit utility for short copy/transition work.
+/// Uses queue_wait_idle for simplicity/stability.
+pub unsafe fn immediate_submit<F: FnOnce(vk::CommandBuffer)>(
+    device: &ash::Device,
     pool: vk::CommandPool,
     queue: vk::Queue,
     f: F,
-) -> Result<(), vk::Result>
-where
-    F: FnOnce(vk::CommandBuffer),
-{
-    unsafe {
-        let cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
+) -> VkResult<()> {
+    let alloc = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
 
-        device.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
+    let cmd = device.allocate_command_buffers(&alloc)?[0];
 
-        f(cmd);
+    device.begin_command_buffer(
+        cmd,
+        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+    )?;
 
-        device.end_command_buffer(cmd)?;
+    f(cmd);
 
-        let submits = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))];
-        device.queue_submit(queue, &submits, vk::Fence::null())?;
-        device.queue_wait_idle(queue)?;
+    device.end_command_buffer(cmd)?;
 
-        device.free_command_buffers(pool, std::slice::from_ref(&cmd));
-    }
+    let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+    device.queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+    device.queue_wait_idle(queue)?;
 
+    device.free_command_buffers(pool, std::slice::from_ref(&cmd));
     Ok(())
 }

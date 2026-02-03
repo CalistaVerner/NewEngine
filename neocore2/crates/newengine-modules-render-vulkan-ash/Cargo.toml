@@ -12,7 +12,6 @@ ash-window = "0.13"
 raw-window-handle = "0.6"
 thiserror = "1.0"
 log = "0.4.29"
-ab_glyph = "0.2"
 
 [build-dependencies]
 shaderc = "0.8"
