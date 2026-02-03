@@ -15,8 +15,9 @@ use winit::{
 };
 
 use newengine_ui::draw::UiDrawList;
-use newengine_ui::{create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions};
-use std::any::Any;
+use newengine_ui::{
+    create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions,
+};
 
 /// Window placement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,24 +71,6 @@ pub struct WinitWindowInitSize {
     pub height: u32,
 }
 
-struct EditorUiBuild;
-
-impl UiBuildFn for EditorUiBuild {
-    fn build(&mut self, ctx_any: &mut dyn Any) {
-        let Some(ctx) = ctx_any.downcast_mut::<egui::Context>() else {
-            return;
-        };
-
-        egui::TopBottomPanel::top("ne_top").show(ctx, |ui| {
-            ui.label("NewEngine UI");
-        });
-
-        egui::Window::new("Stats").show(ctx, |ui| {
-            ui.label("UI online");
-        });
-    }
-}
-
 struct App<E, F>
 where
     E: Send + 'static,
@@ -103,6 +86,7 @@ where
     last_cursor_pos: Option<(f32, f32)>,
 
     ui: Box<dyn UiProvider>,
+    ui_build: Option<Box<dyn UiBuildFn>>,
 }
 
 impl<E, F> App<E, F>
@@ -120,11 +104,19 @@ where
     }
 
     #[inline]
-    fn new(engine: Engine<E>, config: WinitAppConfig, after_window: F) -> Self {
+    fn new(
+        engine: Engine<E>,
+        config: WinitAppConfig,
+        ui_build: Option<Box<dyn UiBuildFn>>,
+        after_window: F,
+    ) -> Self {
         let kind = Self::map_ui_backend_to_provider_kind(&config.ui_backend);
 
         if let UiBackend::Custom(name) = &config.ui_backend {
-            log::warn!("ui backend '{}' is not supported by this host; falling back to Null", name);
+            log::warn!(
+                "ui backend '{}' is not supported by this host; falling back to Null",
+                name
+            );
         }
 
         let ui = create_provider(UiProviderOptions { kind });
@@ -138,11 +130,15 @@ where
             window: None,
             last_cursor_pos: None,
             ui,
+            ui_build,
         }
     }
 
     #[inline]
-    fn build_window_attributes(event_loop: &ActiveEventLoop, config: &WinitAppConfig) -> WindowAttributes {
+    fn build_window_attributes(
+        event_loop: &ActiveEventLoop,
+        config: &WinitAppConfig,
+    ) -> WindowAttributes {
         let (width, height) = config.size;
         let mut attrs = WindowAttributes::default()
             .with_title(config.title.clone())
@@ -164,8 +160,10 @@ where
                 let ms = monitor.size();
                 let mp = monitor.position();
 
-                let cx = mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
-                let cy = mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
+                let cx =
+                    mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
+                let cy =
+                    mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
 
                 attrs = attrs.with_position(PhysicalPosition::new(
                     cx.saturating_add(ox),
@@ -196,8 +194,24 @@ where
         })
     }
 
+    #[inline]
+    fn emit_resized(&mut self, width: u32, height: u32) {
+        self.engine
+            .resources_mut()
+            .insert(WinitWindowInitSize { width, height });
+
+        let _ = self
+            .engine
+            .emit(HostEvent::Window(WindowHostEvent::Resized {
+                width,
+                height,
+            }));
+    }
+
     fn install_window_handles_resource(&mut self) {
-        let Some(w) = &self.window else { return };
+        let Some(w) = &self.window else {
+            return;
+        };
 
         let window = match w.window_handle() {
             Ok(h) => h.as_raw(),
@@ -209,14 +223,18 @@ where
             Err(_) => return,
         };
 
-        self.engine.resources_mut().insert(WinitWindowHandles { window, display });
+        self.engine
+            .resources_mut()
+            .insert(WinitWindowHandles { window, display });
     }
 
     fn install_window_init_size_resource(&mut self) {
         let Some((width, height)) = self.window_size() else {
             return;
         };
-        self.engine.resources_mut().insert(WinitWindowInitSize { width, height });
+        self.engine
+            .resources_mut()
+            .insert(WinitWindowInitSize { width, height });
     }
 
     fn emit_ready(&mut self) {
@@ -231,13 +249,10 @@ where
     }
 
     #[inline]
-    fn emit_resized(&mut self, width: u32, height: u32) {
-        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Resized { width, height }));
-    }
-
-    #[inline]
     fn emit_focused(&mut self, focused: bool) {
-        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
+        let _ = self
+            .engine
+            .emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
     }
 
     #[inline]
@@ -382,7 +397,9 @@ where
 
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::CloseRequested));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Window(WindowHostEvent::CloseRequested));
                 Self::exit(event_loop);
                 return;
             }
@@ -431,10 +448,12 @@ where
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseButton {
-                    button: Self::map_mouse_button(button),
-                    state: Self::map_state(state),
-                }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseButton {
+                        button: Self::map_mouse_button(button),
+                        state: Self::map_state(state),
+                    }));
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -442,28 +461,38 @@ where
                     MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
                 if let Some((px, py)) = self.last_cursor_pos {
-                    let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseDelta {
-                        dx: x - px,
-                        dy: y - py,
-                    }));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Input(InputHostEvent::MouseDelta {
+                            dx: x - px,
+                            dy: y - py,
+                        }));
                 }
                 self.last_cursor_pos = Some((x, y));
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
+                let _ = self
+                    .engine
+                    .emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
             }
 
             WindowEvent::Ime(ime) => match ime {
                 Ime::Commit(text) => {
-                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
                 }
                 Ime::Preedit(text, _) => {
-                    let _ = self.engine.emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
+                    let _ = self
+                        .engine
+                        .emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
                 }
                 Ime::Enabled => {}
                 Ime::Disabled => {}
@@ -485,10 +514,11 @@ where
             return;
         }
 
-        if let Some(w) = self.window.as_ref() {
-            let mut build = EditorUiBuild;
-            let out = self.ui.run_frame(w, UiFrameDesc::new(0.0), &mut build);
-            self.engine.resources_mut().insert::<UiDrawList>(out.draw_list);
+        if let (Some(w), Some(build)) = (self.window.as_ref(), self.ui_build.as_deref_mut()) {
+            let out = self.ui.run_frame(w, UiFrameDesc::new(0.0), build);
+            self.engine
+                .resources_mut()
+                .insert::<UiDrawList>(out.draw_list);
         }
 
         match self.engine.step() {
@@ -508,13 +538,14 @@ where
     E: Send + 'static,
     F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
 {
-    run_winit_app_with_config(engine, WinitAppConfig::default(), after_window)
+    run_winit_app_with_config(engine, WinitAppConfig::default(), None, after_window)
 }
 
 /// Runs winit host with the provided window configuration and starts the engine *after* the window is created.
 pub fn run_winit_app_with_config<E, F>(
     engine: Engine<E>,
     config: WinitAppConfig,
+    ui_build: Option<Box<dyn UiBuildFn>>,
     after_window: F,
 ) -> EngineResult<()>
 where
@@ -522,7 +553,7 @@ where
     F: FnOnce(&mut Engine<E>) -> EngineResult<()> + 'static,
 {
     let event_loop = EventLoop::new().map_err(|e| EngineError::Other(e.to_string()))?;
-    let mut app = App::new(engine, config, after_window);
+    let mut app = App::new(engine, config, ui_build, after_window);
 
     event_loop
         .run_app(&mut app)
