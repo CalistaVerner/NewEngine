@@ -2,7 +2,7 @@ use crate::error::{EngineError, EngineResult, ModuleStage};
 use crate::events::EventHub;
 use crate::frame::Frame;
 use crate::module::{ApiVersion, Bus, Module, ModuleCtx, Resources, Services};
-use crate::plugins::{default_host_api, init_host_context, PluginManager};
+use crate::plugins::{default_host_api, importers_host_api, init_host_context, PluginManager};
 use crate::sched::Scheduler;
 use crate::sync::ShutdownToken;
 use crate::system_info::SystemInfo;
@@ -10,9 +10,11 @@ use crate::AssetManagerConfig;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
+use std::{fmt, thread};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use newengine_assets::{AssetKey, AssetState, TextFormat, TextReader};
+use newengine_assets::store::preview_single_line_escaped;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -243,6 +245,21 @@ impl<E: Send + 'static> Engine<E> {
         Self::log_phase_begin("plugins", phase, None);
         let t0 = Instant::now();
 
+        // 1) Importers: only from `<exe_dir>/importers` (AssetManager ensures the directory exists).
+        if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
+            let host = importers_host_api();
+            if let Err(e) = self.plugins.load_importers_from_dir(am.importers_dir(), host) {
+                log::warn!(
+                target: "assets",
+                "importers: non-fatal load error (phase={} {}): {}",
+                phase,
+                Self::elapsed_since(t0),
+                e
+            );
+            }
+        }
+
+        // 2) Regular plugins: scan the configured plugins directory (no importer auto-registration).
         let host = default_host_api();
 
         let load_result = if let Some(dir) = self.plugins_dir.as_deref() {
@@ -253,11 +270,11 @@ impl<E: Send + 'static> Engine<E> {
 
         if let Err(e) = load_result {
             log::warn!(
-                "plugins: non-fatal load error (phase={} {}): {}",
-                phase,
-                Self::elapsed_since(t0),
-                e
-            );
+            "plugins: non-fatal load error (phase={} {}): {}",
+            phase,
+            Self::elapsed_since(t0),
+            e
+        );
         }
         self.plugins_loaded = true;
 
@@ -559,6 +576,10 @@ impl<E: Send + 'static> Engine<E> {
             Some(list.len()),
             Self::elapsed_since(t_start0),
         );
+
+        //self.smoke_test_load_text("text/hello.txt")?;
+        //self.smoke_test_load_json("text/test.json")?;
+
 
         Ok(())
     }

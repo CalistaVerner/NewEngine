@@ -39,6 +39,7 @@ impl AssetManagerConfig {
 pub struct AssetManager {
     store: Arc<AssetStore>,
     budget: PumpBudget,
+    importers_dir: PathBuf,
 }
 
 impl AssetManager {
@@ -50,6 +51,22 @@ impl AssetManager {
     #[inline]
     pub fn new_with_config(config: AssetManagerConfig) -> Self {
         info!(target: "assets", "manager.init root='{}'", config.root.display());
+
+        let importers_dir = default_importers_dir();
+        if let Err(e) = std::fs::create_dir_all(&importers_dir) {
+            log::warn!(
+                target: "assets",
+                "manager.importers_dir.create failed dir='{}' err='{}'",
+                importers_dir.display(),
+                e
+            );
+        } else {
+            info!(
+                target: "assets",
+                "manager.importers_dir ready='{}'",
+                importers_dir.display()
+            );
+        }
 
         let store = Arc::new(AssetStore::new());
 
@@ -66,7 +83,19 @@ impl AssetManager {
         let budget = PumpBudget::steps(steps);
         info!(target: "assets", "manager.budget steps={}", budget.steps);
 
-        Self { store, budget }
+        Self {
+            store,
+            budget,
+            importers_dir,
+        }
+    }
+
+    /// Directory where asset importer dynamic libraries are discovered.
+    ///
+    /// By default this is `<exe_dir>/importers`.
+    #[inline]
+    pub fn importers_dir(&self) -> &std::path::Path {
+        &self.importers_dir
     }
 
     /// Returns a shared handle to the underlying store.
@@ -126,4 +155,13 @@ impl AssetManager {
         self.pump();
         self.drain_events()
     }
+}
+
+fn default_importers_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let base = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("importers")
 }

@@ -3,6 +3,7 @@
 use abi_stable::std_types::{RResult, RString};
 use libloading::Library;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -164,8 +165,6 @@ fn try_auto_register_importer(service_id: &str, describe_json: &str) {
         return;
     };
 
-    // Optional guard: if plugin declares a wire string, you can enforce a known one.
-    // We keep it permissive for now.
     let _wire = imp.wire;
 
     let importer = ServiceBlobImporter {
@@ -181,6 +180,15 @@ fn try_auto_register_importer(service_id: &str, describe_json: &str) {
     let ctx = ctx();
     ctx.asset_store.add_importer(Arc::new(importer));
     log::info!(target: "assets", "importer.auto_registered service_id='{}'", service_id);
+}
+
+#[inline]
+fn is_asset_importer(describe_json: &str) -> bool {
+    let parsed: ServiceDescribe = match serde_json::from_str(describe_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed.kind.as_deref() == Some("asset_importer") && parsed.asset_importer.is_some()
 }
 
 /* =============================================================================================
@@ -199,8 +207,10 @@ extern "C" fn host_log_error(s: RString) {
     log::error!("{}", s);
 }
 
-extern "C" fn host_register_service_v1(svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
-    // Read before moving into registry; no Clone required.
+fn host_register_service_impl(
+    svc: ServiceV1Dyn<'static>,
+    auto_register_importer: bool,
+) -> RResult<(), RString> {
     let service_id = svc.id().to_string();
     let describe_json = svc.describe().to_string();
 
@@ -222,8 +232,44 @@ extern "C" fn host_register_service_v1(svc: ServiceV1Dyn<'static>) -> RResult<()
         g.insert(service_id.clone(), svc);
     }
 
-    try_auto_register_importer(&service_id, &describe_json);
+    if auto_register_importer {
+        try_auto_register_importer(&service_id, &describe_json);
+    }
+
     RResult::ROk(())
+}
+
+extern "C" fn host_register_service_v1_plain(svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
+    host_register_service_impl(svc, false)
+}
+
+struct ImporterLoadState {
+    saw_importer: bool,
+    staged: Vec<ServiceV1Dyn<'static>>,
+}
+
+thread_local! {
+    static IMPORTER_LOAD_STATE: Cell<*mut ImporterLoadState> =
+        const { Cell::new(std::ptr::null_mut()) };
+}
+
+extern "C" fn host_register_service_v1_importers(svc: ServiceV1Dyn<'static>) -> RResult<(), RString> {
+    IMPORTER_LOAD_STATE.with(|slot| {
+        let p = slot.get();
+        if p.is_null() {
+            return RResult::RErr(RString::from("importer loader: host state is not set"));
+        }
+
+        let st = unsafe { &mut *p };
+
+        let describe_json = svc.describe().to_string();
+        if is_asset_importer(&describe_json) {
+            st.saw_importer = true;
+        }
+
+        st.staged.push(svc);
+        RResult::ROk(())
+    })
 }
 
 extern "C" fn host_call_service_v1(
@@ -261,7 +307,21 @@ pub fn default_host_api() -> HostApiV1 {
         log_warn: host_log_warn,
         log_error: host_log_error,
 
-        register_service_v1: host_register_service_v1,
+        register_service_v1: host_register_service_v1_plain,
+        call_service_v1: host_call_service_v1,
+
+        emit_event_v1: host_emit_event_v1,
+        subscribe_events_v1: host_subscribe_events_v1,
+    }
+}
+
+pub fn importers_host_api() -> HostApiV1 {
+    HostApiV1 {
+        log_info: host_log_info,
+        log_warn: host_log_warn,
+        log_error: host_log_error,
+
+        register_service_v1: host_register_service_v1_importers,
         call_service_v1: host_call_service_v1,
 
         emit_event_v1: host_emit_event_v1,
@@ -290,7 +350,7 @@ impl std::error::Error for PluginLoadError {}
 struct LoadedPlugin {
     _lib: Library,
     module: PluginModuleDyn<'static>,
-    info: PluginInfo
+    info: PluginInfo,
 }
 
 pub struct PluginManager {
@@ -311,6 +371,86 @@ impl PluginManager {
     pub fn load_default(&mut self, host: HostApiV1) -> Result<(), PluginLoadError> {
         let dir = default_plugins_dir()?;
         self.load_from_dir(&dir, host)
+    }
+
+    pub fn load_importers_default(&mut self, host: HostApiV1) -> Result<(), PluginLoadError> {
+        let dir = default_plugins_dir()?;
+        self.load_importers_from_dir(&dir.join("importers"), host)
+    }
+
+    pub fn load_importers_from_dir(
+        &mut self,
+        dir: &Path,
+        host: HostApiV1,
+    ) -> Result<(), PluginLoadError> {
+        let dir = resolve_plugins_dir(dir)?;
+        log::info!(target: "assets", "importers: scanning directory '{}'", dir.display());
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(PluginLoadError {
+                path: dir.clone(),
+                message: format!("create_dir_all failed: {e}"),
+            });
+        }
+
+        let mut candidates = Vec::new();
+        let rd = std::fs::read_dir(&dir).map_err(|e| PluginLoadError {
+            path: dir.clone(),
+            message: format!("read_dir failed: {e}"),
+        })?;
+
+        for ent in rd {
+            let ent = ent.map_err(|e| PluginLoadError {
+                path: dir.clone(),
+                message: format!("read_dir entry failed: {e}"),
+            })?;
+
+            let p = ent.path();
+            if !is_dynamic_lib(&p) {
+                continue;
+            }
+            candidates.push(p);
+        }
+
+        candidates.sort();
+
+        log::info!(
+            target: "assets",
+            "importers: found {} candidate(s) in '{}'",
+            candidates.len(),
+            dir.display()
+        );
+
+        for path in candidates {
+            match self.load_one_importer(&path, host.clone()) {
+                Ok(ImporterLoadOutcome::Loaded(info)) => {
+                    log::info!(
+                        target: "assets",
+                        "importers: loaded id='{}' ver='{}' from '{}'",
+                        info.id,
+                        info.version,
+                        path.display()
+                    );
+                }
+                Ok(ImporterLoadOutcome::SkippedNotImporter) => {
+                    log::debug!(
+                        target: "assets",
+                        "importers: skipped (not an importer) '{}'",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "assets",
+                        "importers: failed to load '{}': {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn load_from_dir(&mut self, dir: &Path, host: HostApiV1) -> Result<(), PluginLoadError> {
@@ -356,14 +496,10 @@ impl PluginManager {
         Ok(())
     }
 
-
     pub fn start_all(&mut self) -> Result<(), String> {
         for p in self.loaded.iter_mut() {
             if let Err(e) = p.module.start().into_result() {
-                return Err(format!(
-                    "plugin '{}' start failed: {}",
-                    p.info.id, e
-                ));
+                return Err(format!("plugin '{}' start failed: {}", p.info.id, e));
             }
         }
         Ok(())
@@ -372,10 +508,7 @@ impl PluginManager {
     pub fn fixed_update_all(&mut self, dt: f32) -> Result<(), String> {
         for p in self.loaded.iter_mut() {
             if let Err(e) = p.module.fixed_update(dt).into_result() {
-                return Err(format!(
-                    "plugin '{}' fixed_update failed: {}",
-                    p.info.id, e
-                ));
+                return Err(format!("plugin '{}' fixed_update failed: {}", p.info.id, e));
             }
         }
         Ok(())
@@ -414,7 +547,6 @@ impl PluginManager {
             message: format!("Library::new failed: {e}"),
         })?;
 
-        // ABI: PluginRootV1Ref::BASE_NAME == "export_plugin_root"
         let sym: libloading::Symbol<unsafe extern "C" fn() -> PluginRootV1Ref> =
             unsafe { lib.get(b"export_plugin_root\0") }.map_err(|e| PluginLoadError {
                 path: path.to_path_buf(),
@@ -442,28 +574,97 @@ impl PluginManager {
         self.loaded.push(LoadedPlugin {
             _lib: lib,
             module,
-            info
+            info,
         });
 
         Ok(())
     }
+
+    fn load_one_importer(
+        &mut self,
+        path: &Path,
+        host: HostApiV1,
+    ) -> Result<ImporterLoadOutcome, PluginLoadError> {
+        log::info!(target: "assets", "importers: loading '{}'", path.display());
+
+        let lib = unsafe { Library::new(path) }.map_err(|e| PluginLoadError {
+            path: path.to_path_buf(),
+            message: format!("Library::new failed: {e}"),
+        })?;
+
+        let sym: libloading::Symbol<unsafe extern "C" fn() -> PluginRootV1Ref> =
+            unsafe { lib.get(b"export_plugin_root\0") }.map_err(|e| PluginLoadError {
+                path: path.to_path_buf(),
+                message: format!("symbol export_plugin_root not found: {e}"),
+            })?;
+
+        let root = unsafe { sym() };
+        let mut module = root.create()();
+
+        let mut state = ImporterLoadState {
+            saw_importer: false,
+            staged: Vec::new(),
+        };
+
+        let init_result = IMPORTER_LOAD_STATE.with(|slot| {
+            let prev = slot.replace(&mut state as *mut _);
+            let r = module.init(host).into_result();
+            slot.set(prev);
+            r
+        });
+
+        if let Err(e) = init_result {
+            return Err(PluginLoadError {
+                path: path.to_path_buf(),
+                message: format!("init failed: {e}"),
+            });
+        }
+
+        if !state.saw_importer {
+            module.shutdown();
+            drop(module);
+            drop(lib);
+            return Ok(ImporterLoadOutcome::SkippedNotImporter);
+        }
+
+        for svc in state.staged.drain(..) {
+            if let Err(e) = host_register_service_impl(svc, true).into_result() {
+                module.shutdown();
+                return Err(PluginLoadError {
+                    path: path.to_path_buf(),
+                    message: format!("register_service_v1 failed: {e}"),
+                });
+            }
+        }
+
+        let info = module.info();
+
+        self.loaded.push(LoadedPlugin {
+            _lib: lib,
+            module,
+            info: info.clone(),
+        });
+
+        Ok(ImporterLoadOutcome::Loaded(info))
+    }
+}
+
+enum ImporterLoadOutcome {
+    Loaded(PluginInfo),
+    SkippedNotImporter,
 }
 
 fn resolve_plugins_dir(dir: &Path) -> Result<PathBuf, PluginLoadError> {
-    // 1) Empty path => default to exe directory.
     if dir.as_os_str().is_empty() {
         return default_plugins_dir();
     }
 
-    // 2) "." is acceptable, but we still resolve it relative to exe dir for stability.
     let is_dot = dir == Path::new(".");
 
-    // 3) Absolute path => use as-is.
     if dir.is_absolute() && !is_dot {
         return Ok(dir.to_path_buf());
     }
 
-    // 4) Relative => resolve against exe dir (not cwd).
     let base = default_plugins_dir()?;
     if is_dot {
         return Ok(base);
