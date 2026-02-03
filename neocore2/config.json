@@ -12,6 +12,10 @@
     }
   },
 
+  "ui": {
+    "backend": "egui"
+  },
+
   "engine": {
     "modules_dir": ".",
     "assets_root": "assets",
