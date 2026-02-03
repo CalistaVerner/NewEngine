@@ -8,6 +8,8 @@ pub mod store;
 pub mod texture;
 pub mod types;
 
+pub mod text_reader;
+
 pub use events::AssetEvent;
 pub use id::AssetId;
 pub use importers::Importer;
@@ -17,3 +19,5 @@ pub use texture::{TextureAsset, TextureDesc, TextureFormat, TextureKind, Texture
 pub use types::{
     Asset, AssetBlob, AssetDependency, AssetError, AssetKey, AssetState, ImporterPriority,
 };
+
+pub use text_reader::{TextDocument, TextFormat, TextMeta, TextReadError, TextReader};
