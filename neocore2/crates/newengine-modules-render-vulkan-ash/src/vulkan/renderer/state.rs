@@ -78,4 +78,8 @@ pub struct VulkanRenderer {
     pub(crate) ui_ib: vk::Buffer,
     pub(crate) ui_ib_mem: vk::DeviceMemory,
     pub(crate) ui_ib_size: vk::DeviceSize,
+
+    pub(crate) ui_staging_buf: vk::Buffer,
+    pub(crate) ui_staging_mem: vk::DeviceMemory,
+    pub(crate) ui_staging_size: vk::DeviceSize,
 }

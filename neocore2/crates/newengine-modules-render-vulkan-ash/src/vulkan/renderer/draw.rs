@@ -129,8 +129,10 @@ impl VulkanRenderer {
                 && self.text_desc_set != vk::DescriptorSet::null()
                 && self.text_vb != vk::Buffer::null()
             {
-                let dbg = self.debug_text.clone();
-                self.draw_text_overlay(cmd, &dbg)?;
+                let debug_text = std::mem::take(&mut self.debug_text);
+                let res = self.draw_text_overlay(cmd, &debug_text);
+                self.debug_text = debug_text;
+                res?;
             }
 
             if let Some(list) = self.pending_ui.take() {

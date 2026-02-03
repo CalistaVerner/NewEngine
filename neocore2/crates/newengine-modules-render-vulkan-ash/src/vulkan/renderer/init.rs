@@ -210,6 +210,10 @@ impl VulkanRenderer {
             ui_ib: vk::Buffer::null(),
             ui_ib_mem: vk::DeviceMemory::null(),
             ui_ib_size: 0,
+
+            ui_staging_buf: vk::Buffer::null(),
+            ui_staging_mem: vk::DeviceMemory::null(),
+            ui_staging_size: 0,
         };
 
         me.init_text_overlay()?;

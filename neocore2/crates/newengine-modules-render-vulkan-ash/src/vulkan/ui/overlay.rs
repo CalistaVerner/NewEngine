@@ -67,10 +67,27 @@ impl VulkanRenderer {
         if self.ui_ib_mem != vk::DeviceMemory::null() {
             self.device.free_memory(self.ui_ib_mem, None);
         }
+
+        if self.ui_staging_buf != vk::Buffer::null() {
+            self.device.destroy_buffer(self.ui_staging_buf, None);
+            self.ui_staging_buf = vk::Buffer::null();
+        }
+        if self.ui_staging_mem != vk::DeviceMemory::null() {
+            self.device.free_memory(self.ui_staging_mem, None);
+            self.ui_staging_mem = vk::DeviceMemory::null();
+        }
+        self.ui_staging_size = 0;
     }
 
     unsafe fn destroy_ui_resources(&mut self) {
         for (_id, tex) in self.ui_textures.drain() {
+            if tex.desc_set != vk::DescriptorSet::null()
+                && self.ui_desc_pool != vk::DescriptorPool::null()
+            {
+                let _ = self
+                    .device
+                    .free_descriptor_sets(self.ui_desc_pool, &[tex.desc_set]);
+            }
             if tex.view != vk::ImageView::null() {
                 self.device.destroy_image_view(tex.view, None);
             }
@@ -111,6 +128,7 @@ impl VulkanRenderer {
 
         self.ui_desc_pool = self.device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
+                .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                 .max_sets(1024)
                 .pool_sizes(std::slice::from_ref(&pool_size)),
             None,
@@ -120,14 +138,160 @@ impl VulkanRenderer {
     }
 
     pub(super) unsafe fn ui_apply_delta(&mut self, delta: &UiTextureDelta) -> VkResult<()> {
-        for (id, tex) in &delta.set {
-            self.ui_create_or_replace_texture(*id, tex.size, &tex.rgba8)?;
+        #[derive(Clone, Copy)]
+        enum UploadKind {
+            New,
+            Patch { origin: [u32; 2] },
         }
 
-        for patch in &delta.patches {
-            self.ui_patch_texture(patch.id, patch.origin, patch.size, &patch.rgba8)?;
+        #[derive(Clone, Copy)]
+        struct UploadOp {
+            image: vk::Image,
+            old_layout: vk::ImageLayout,
+            offset: vk::DeviceSize,
+            extent: vk::Extent3D,
+            kind: UploadKind,
         }
 
+        let mut total_bytes: vk::DeviceSize = 0;
+        for (_id, tex) in &delta.set {
+            total_bytes += tex.rgba8.len() as vk::DeviceSize;
+        }
+        for p in &delta.patches {
+            total_bytes += p.rgba8.len() as vk::DeviceSize;
+        }
+
+        let mut ops: Vec<UploadOp> = Vec::with_capacity(delta.set.len() + delta.patches.len());
+
+        if total_bytes != 0 {
+            self.ui_ensure_staging(total_bytes)?;
+
+            let mapped = self.device.map_memory(
+                self.ui_staging_mem,
+                0,
+                total_bytes,
+                vk::MemoryMapFlags::empty(),
+            )? as *mut u8;
+
+            let mut cursor: vk::DeviceSize = 0;
+
+            // Creates/replaces textures and schedules their uploads.
+            for (id, tex) in &delta.set {
+                let offset = cursor;
+                let bytes = tex.rgba8.len() as vk::DeviceSize;
+                ptr::copy_nonoverlapping(
+                    tex.rgba8.as_ptr(),
+                    mapped.add(offset as usize),
+                    bytes as usize,
+                );
+                cursor += bytes;
+
+                let gpu = self.ui_create_texture_objects(*id, tex.size)?;
+
+                ops.push(UploadOp {
+                    image: gpu.image,
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    offset,
+                    extent: vk::Extent3D {
+                        width: tex.size[0],
+                        height: tex.size[1],
+                        depth: 1,
+                    },
+                    kind: UploadKind::New,
+                });
+            }
+
+            // Schedules patches.
+            for p in &delta.patches {
+                let Some(tex) = self.ui_textures.get(&p.id.0) else {
+                    continue;
+                };
+
+                let offset = cursor;
+                let bytes = p.rgba8.len() as vk::DeviceSize;
+                ptr::copy_nonoverlapping(
+                    p.rgba8.as_ptr(),
+                    mapped.add(offset as usize),
+                    bytes as usize,
+                );
+                cursor += bytes;
+
+                ops.push(UploadOp {
+                    image: tex.image,
+                    old_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    offset,
+                    extent: vk::Extent3D {
+                        width: p.size[0],
+                        height: p.size[1],
+                        depth: 1,
+                    },
+                    kind: UploadKind::Patch { origin: p.origin },
+                });
+            }
+
+            debug_assert!(cursor == total_bytes);
+
+            self.device.unmap_memory(self.ui_staging_mem);
+
+            // One submit for the whole delta.
+            immediate_submit(&self.device, self.upload_command_pool, self.queue, |cmd| {
+                for op in &ops {
+                    transition_image_layout(
+                        &self.device,
+                        cmd,
+                        op.image,
+                        op.old_layout,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    );
+
+                    let mut region = vk::BufferImageCopy::default()
+                        .buffer_offset(op.offset)
+                        .buffer_row_length(0)
+                        .buffer_image_height(0)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(0)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .image_extent(op.extent);
+
+                    if let UploadKind::Patch { origin } = op.kind {
+                        region = region.image_offset(vk::Offset3D {
+                            x: origin[0] as i32,
+                            y: origin[1] as i32,
+                            z: 0,
+                        });
+                    } else {
+                        region = region.image_offset(vk::Offset3D { x: 0, y: 0, z: 0 });
+                    }
+
+                    self.device.cmd_copy_buffer_to_image(
+                        cmd,
+                        self.ui_staging_buf,
+                        op.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        std::slice::from_ref(&region),
+                    );
+
+                    transition_image_layout(
+                        &self.device,
+                        cmd,
+                        op.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
+                }
+            })?;
+        } else {
+            // No uploads, but we still may free textures.
+            for (id, tex) in &delta.set {
+                let _ = (id, tex);
+            }
+        }
+
+        // Frees are independent and can be done after uploads.
         for id in &delta.free {
             self.ui_free_texture(*id);
         }
@@ -137,43 +301,56 @@ impl VulkanRenderer {
 
     unsafe fn ui_free_texture(&mut self, id: UiTexId) {
         if let Some(tex) = self.ui_textures.remove(&id.0) {
+            if tex.desc_set != vk::DescriptorSet::null()
+                && self.ui_desc_pool != vk::DescriptorPool::null()
+            {
+                let _ = self
+                    .device
+                    .free_descriptor_sets(self.ui_desc_pool, &[tex.desc_set]);
+            }
             self.device.destroy_image_view(tex.view, None);
             self.device.destroy_image(tex.image, None);
             self.device.free_memory(tex.mem, None);
         }
     }
 
-    unsafe fn ui_create_or_replace_texture(
-        &mut self,
-        id: UiTexId,
-        size: [u32; 2],
-        rgba8: &[u8],
-    ) -> VkResult<()> {
-        self.ui_free_texture(id);
-
-        let (w, h) = (size[0], size[1]);
-        let expected = (w as usize) * (h as usize) * 4;
-        if rgba8.len() != expected {
-            return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT.into());
+    unsafe fn ui_ensure_staging(&mut self, required: vk::DeviceSize) -> VkResult<()> {
+        if self.ui_staging_buf != vk::Buffer::null() && required <= self.ui_staging_size {
+            return Ok(());
         }
 
-        let staging_size = rgba8.len() as vk::DeviceSize;
-        let (staging_buf, staging_mem) = create_buffer(
+        if self.ui_staging_buf != vk::Buffer::null() {
+            self.device.destroy_buffer(self.ui_staging_buf, None);
+            self.ui_staging_buf = vk::Buffer::null();
+        }
+        if self.ui_staging_mem != vk::DeviceMemory::null() {
+            self.device.free_memory(self.ui_staging_mem, None);
+            self.ui_staging_mem = vk::DeviceMemory::null();
+        }
+
+        self.ui_staging_size = required.max(64 * 1024);
+        let (buf, mem) = create_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
-            staging_size,
+            self.ui_staging_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        let mapped =
-            self.device
-                .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
-                as *mut u8;
-        ptr::copy_nonoverlapping(rgba8.as_ptr(), mapped, rgba8.len());
-        self.device.unmap_memory(staging_mem);
+        self.ui_staging_buf = buf;
+        self.ui_staging_mem = mem;
+        Ok(())
+    }
 
+    unsafe fn ui_create_texture_objects(
+        &mut self,
+        id: UiTexId,
+        size: [u32; 2],
+    ) -> VkResult<GpuUiTexture> {
+        self.ui_free_texture(id);
+
+        let (w, h) = (size[0], size[1]);
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
@@ -206,53 +383,6 @@ impl VulkanRenderer {
 
         let mem = self.device.allocate_memory(&alloc, None)?;
         self.device.bind_image_memory(image, mem, 0)?;
-
-        immediate_submit(&self.device, self.upload_command_pool, self.queue, |cmd| {
-            transition_image_layout(
-                &self.device,
-                cmd,
-                image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                });
-
-            self.device.cmd_copy_buffer_to_image(
-                cmd,
-                staging_buf,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
-            );
-
-            transition_image_layout(
-                &self.device,
-                cmd,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
-        })?;
-
-        self.device.destroy_buffer(staging_buf, None);
-        self.device.free_memory(staging_mem, None);
 
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
@@ -290,106 +420,16 @@ impl VulkanRenderer {
         self.device
             .update_descriptor_sets(std::slice::from_ref(&write), &[]);
 
-        self.ui_textures.insert(
-            id.0,
-            GpuUiTexture {
-                image,
-                mem,
-                view,
-                desc_set,
-                size,
-            },
-        );
-
-        Ok(())
-    }
-
-    unsafe fn ui_patch_texture(
-        &mut self,
-        id: UiTexId,
-        origin: [u32; 2],
-        size: [u32; 2],
-        rgba8: &[u8],
-    ) -> VkResult<()> {
-        let Some(tex) = self.ui_textures.get(&id.0) else {
-            return Ok(());
+        let gpu = GpuUiTexture {
+            image,
+            mem,
+            view,
+            desc_set,
+            size,
         };
 
-        let (w, h) = (size[0], size[1]);
-        let expected = (w as usize) * (h as usize) * 4;
-        if rgba8.len() != expected {
-            return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT.into());
-        }
-
-        let staging_size = rgba8.len() as vk::DeviceSize;
-        let (staging_buf, staging_mem) = create_buffer(
-            &self.instance,
-            self.physical_device,
-            &self.device,
-            staging_size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
-        let mapped =
-            self.device
-                .map_memory(staging_mem, 0, staging_size, vk::MemoryMapFlags::empty())?
-                as *mut u8;
-        ptr::copy_nonoverlapping(rgba8.as_ptr(), mapped, rgba8.len());
-        self.device.unmap_memory(staging_mem);
-
-        immediate_submit(&self.device, self.upload_command_pool, self.queue, |cmd| {
-            transition_image_layout(
-                &self.device,
-                cmd,
-                tex.image,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .mip_level(0)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                )
-                .image_offset(vk::Offset3D {
-                    x: origin[0] as i32,
-                    y: origin[1] as i32,
-                    z: 0,
-                })
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                });
-
-            self.device.cmd_copy_buffer_to_image(
-                cmd,
-                staging_buf,
-                tex.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
-            );
-
-            transition_image_layout(
-                &self.device,
-                cmd,
-                tex.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
-        })?;
-
-        self.device.destroy_buffer(staging_buf, None);
-        self.device.free_memory(staging_mem, None);
-
-        Ok(())
+        self.ui_textures.insert(id.0, gpu);
+        Ok(gpu)
     }
 
     pub(super) unsafe fn ui_ensure_buffers(
