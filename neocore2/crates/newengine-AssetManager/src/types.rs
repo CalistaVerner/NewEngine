@@ -11,8 +11,8 @@ pub struct AssetKey {
 impl AssetKey {
     #[inline]
     pub fn new(logical_path: impl Into<PathBuf>, settings_hash: u64) -> Self {
-        let mut p = logical_path.into();
-        p = normalize_logical_path(&p);
+        let p = normalize_logical_path(logical_path.into())
+            .unwrap_or_else(|_| PathBuf::from("invalid_path"));
         Self {
             logical_path: p,
             settings_hash,
@@ -92,13 +92,18 @@ impl ImporterPriority {
     }
 }
 
+#[derive(Debug)]
+enum NormalizePathError {
+    Invalid,
+}
+
+/// Logical path contract:
+/// - relative
+/// - no root/prefix
+/// - no '.' or '..'
+/// - platform-stable via components joining
 #[inline]
-fn normalize_logical_path(p: &Path) -> PathBuf {
-    // Logical path contract:
-    // - relative
-    // - no root prefix
-    // - no '.' or '..' escapes
-    // - forward-slash equivalent via components joining
+fn normalize_logical_path(p: PathBuf) -> Result<PathBuf, NormalizePathError> {
     let mut out = PathBuf::new();
 
     for c in p.components() {
@@ -106,14 +111,19 @@ fn normalize_logical_path(p: &Path) -> PathBuf {
             Component::Normal(x) => out.push(x),
             Component::CurDir => {}
             Component::ParentDir => {
-                // refuse path traversal: drop parent dirs deterministically
-                // (host can choose to error earlier if desired)
+                // Reject traversal deterministically to keep AssetId stable and non-ambiguous.
+                return Err(NormalizePathError::Invalid);
             }
             Component::Prefix(_) | Component::RootDir => {
-                // strip absolute prefixes for logical path stability
+                // Strip absolute prefixes for logical path stability.
+                return Err(NormalizePathError::Invalid);
             }
         }
     }
 
-    out
+    if out.as_os_str().is_empty() {
+        return Err(NormalizePathError::Invalid);
+    }
+
+    Ok(out)
 }

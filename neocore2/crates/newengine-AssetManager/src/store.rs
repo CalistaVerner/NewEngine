@@ -58,7 +58,6 @@ impl std::fmt::Debug for PendingRequest {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ImporterBindingInfo {
     pub ext: String,
@@ -136,12 +135,7 @@ impl AssetStore {
         for ext in exts {
             let norm_ext = normalize_ext(&ext);
 
-            info!(
-                target: "assets",
-                "importer.bind id='{}' ext='.{}'",
-                stable_id,
-                norm_ext
-            );
+            info!(target: "assets", "importer.bind id='{}' ext='.{}'", stable_id, norm_ext);
 
             let list = g.importers_by_ext.entry(norm_ext).or_default();
             list.push(importer.clone());
@@ -226,7 +220,6 @@ impl AssetStore {
                 key.logical_path.display(),
                 ext
             );
-
             return Err(AssetError::new(format!(
                 "AssetStore: no importer registered for extension '.{}'",
                 ext
@@ -241,7 +234,6 @@ impl AssetStore {
                 key.logical_path.display(),
                 ext
             );
-
             return Err(AssetError::new(format!(
                 "AssetStore: no importer registered for extension '.{}'",
                 ext
@@ -470,4 +462,39 @@ fn read_from_any_source_list(
         "AssetStore: asset not found in any source: '{}'",
         logical_path.to_string_lossy()
     )))
+}
+
+/// Utility: stable single-line preview for logs/UI.
+///
+/// - Limits by char count (not bytes)
+/// - Replaces '\r' with "" (elide) and '\n' with "\n"
+/// - Escapes non-printable characters
+#[inline]
+pub fn preview_single_line_escaped(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars * 2).max(32));
+    let mut count = 0usize;
+
+    for ch in s.chars() {
+        if count >= max_chars {
+            out.push_str("…");
+            break;
+        }
+        count += 1;
+
+        match ch {
+            '\r' => {
+                // drop CR to avoid console artifacts
+            }
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                // escape as \u{..}
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+
+    out
 }
