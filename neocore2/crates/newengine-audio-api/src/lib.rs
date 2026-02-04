@@ -13,9 +13,11 @@ pub mod music;
 pub mod system;
 pub mod vehicle;
 pub mod voice;
+pub mod protocol;
 
 pub mod audio_api;
 pub mod capability;
+mod occlusion;
 
 pub mod prelude {
     pub use crate::ambience::*;

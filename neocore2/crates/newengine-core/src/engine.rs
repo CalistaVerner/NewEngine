@@ -10,11 +10,9 @@ use crate::AssetManagerConfig;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::{fmt, thread};
+use std::{fmt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use newengine_assets::{AssetKey, AssetState, TextFormat, TextReader};
-use newengine_assets::store::preview_single_line_escaped;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -46,8 +44,9 @@ pub struct Engine<E: Send + 'static> {
     modules: Vec<Box<dyn Module<E>>>,
     module_ids: HashSet<&'static str>,
 
-    resources: Resources,
+    pub resources: Resources,
     bus: Bus<E>,
+
     events: EventHub,
     scheduler: Scheduler,
 
@@ -76,10 +75,7 @@ impl Elapsed {
     fn from_duration(d: Duration) -> Self {
         let us = d.as_micros();
         if us < 1000 {
-            Self {
-                value: us,
-                unit: "us",
-            }
+            Self { value: us, unit: "us" }
         } else {
             Self {
                 value: d.as_millis(),
@@ -103,6 +99,15 @@ impl<E: Send + 'static> Engine<E> {
         self.shutdown.request();
     }
 
+    /// Loads plugins/importers once (idempotent).
+    ///
+    /// This does NOT initialize or start modules. It only populates the plugin registry and,
+    /// importantly, registers asset importers from the importers directory.
+    #[inline]
+    pub fn load_plugins_once(&mut self) -> EngineResult<()> {
+        self.try_load_plugins_once()
+    }
+
     #[inline]
     pub fn shutdown_token(&self) -> ShutdownToken {
         self.shutdown.clone()
@@ -115,7 +120,7 @@ impl<E: Send + 'static> Engine<E> {
 
     pub fn emit<T>(&self, event: T) -> EngineResult<()>
     where
-        T: Any + Send + 'static + std::marker::Sync,
+        T: Any + Send + 'static + Sync,
     {
         self.events.publish(event)
     }
@@ -127,7 +132,7 @@ impl<E: Send + 'static> Engine<E> {
         shutdown: ShutdownToken,
     ) -> EngineResult<Self> {
         let assets_root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .unwrap_or_else(|_| PathBuf::from("."))
             .join("assets");
         let config = EngineConfig::new(fixed_dt_ms, AssetManagerConfig::new(assets_root));
         Self::new_with_config(config, services, bus, shutdown)
@@ -151,7 +156,9 @@ impl<E: Send + 'static> Engine<E> {
             .expect("AssetManager missing")
             .store()
             .clone();
-        init_host_context(asset_store);
+        init_host_context(asset_store.clone());
+        crate::assets_service::register_asset_manager_service(asset_store.clone());
+        crate::console::init_console_service();
 
         Ok(Self {
             fixed_dt,
@@ -194,9 +201,7 @@ impl<E: Send + 'static> Engine<E> {
 
         let id = module.id();
         if self.module_ids.contains(id) {
-            return Err(EngineError::Other(format!(
-                "module already registered: {id}"
-            )));
+            return Err(EngineError::Other(format!("module already registered: {id}")));
         }
 
         self.modules.push(module);
@@ -218,12 +223,7 @@ impl<E: Send + 'static> Engine<E> {
     }
 
     #[inline]
-    fn log_phase_ok(
-        scope: &'static str,
-        phase: &'static str,
-        count: Option<usize>,
-        elapsed: Elapsed,
-    ) {
+    fn log_phase_ok(scope: &'static str, phase: &'static str, count: Option<usize>, elapsed: Elapsed) {
         match count {
             Some(n) => log::info!("{scope}: done (phase={phase} count={n} {elapsed})"),
             None => log::info!("{scope}: done (phase={phase} {elapsed})"),
@@ -250,12 +250,12 @@ impl<E: Send + 'static> Engine<E> {
             let host = importers_host_api();
             if let Err(e) = self.plugins.load_importers_from_dir(am.importers_dir(), host) {
                 log::warn!(
-                target: "assets",
-                "importers: non-fatal load error (phase={} {}): {}",
-                phase,
-                Self::elapsed_since(t0),
-                e
-            );
+                    target: "assets",
+                    "importers: non-fatal load error (phase={} {}): {}",
+                    phase,
+                    Self::elapsed_since(t0),
+                    e
+                );
             }
         }
 
@@ -270,84 +270,117 @@ impl<E: Send + 'static> Engine<E> {
 
         if let Err(e) = load_result {
             log::warn!(
-            "plugins: non-fatal load error (phase={} {}): {}",
-            phase,
-            Self::elapsed_since(t0),
-            e
-        );
+                "plugins: non-fatal load error (phase={} {}): {}",
+                phase,
+                Self::elapsed_since(t0),
+                e
+            );
         }
+
         self.plugins_loaded = true;
 
         let loaded = self.plugins.iter().count();
         Self::log_phase_ok("plugins", phase, Some(loaded), Self::elapsed_since(t0));
 
-        // Diagnostics: expose the effective asset importer registry after plugins loaded.
-        // Diagnostics: expose the effective asset importer registry after plugins loaded.
-        if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
-            let bindings = am.store().importer_bindings();
-
-            if bindings.is_empty() {
-                log::info!(target: "assets", "importer.registry empty (no bindings)");
-                log::info!(target: "assets", "importer.formats readable=<none>");
-            } else {
-                log::info!(
-                    target: "assets",
-                    "importer.registry bindings={} (after plugins load)",
-                    bindings.len()
-                );
-
-                // Summarize readable formats.
-                // We do not assume ordering/priority semantics; we report:
-                // - unique extensions
-                // - and (for each extension) list unique importers that can handle it.
-                use std::collections::{BTreeMap, BTreeSet};
-
-                let mut exts: BTreeSet<String> = BTreeSet::new();
-                let mut by_ext: BTreeMap<String, Vec<&_>> = BTreeMap::new();
-
-                for b in bindings.iter() {
-                    // Normalize: always show with leading dot in summary.
-                    let ext = format!(".{}", b.ext.trim_start_matches('.').to_ascii_lowercase());
-                    exts.insert(ext.clone());
-                    by_ext.entry(ext).or_default().push(b);
-                }
-
-                // One-line formats list: ".dds, .png, .obj"
-                let formats_line = exts.iter().cloned().collect::<Vec<_>>().join(", ");
-                log::info!(target: "assets", "importer.formats readable=[{}]", formats_line);
-
-                // Optional: per-extension breakdown (still INFO, but compact).
-                // Shows which plugin/importer ids provide the capability for a given extension.
-                for (ext, list) in by_ext.iter() {
-                    // Deduplicate by stable_id/type/priority to avoid spam.
-                    let mut uniq: BTreeSet<String> = BTreeSet::new();
-                    for b in list.iter() {
-                        uniq.insert(format!(
-                            "id='{}' type='{}' prio={}",
-                            b.stable_id, b.output_type_id, b.priority.0
-                        ));
-                    }
-                    let providers = uniq.into_iter().collect::<Vec<_>>().join("; ");
-                    log::info!(target: "assets", "importer.format {} -> {}", ext, providers);
-                }
-
-                // Existing detailed debug dump remains for deep inspection.
-                if log::log_enabled!(log::Level::Debug) {
-                    for b in bindings {
-                        log::debug!(
-                            target: "assets",
-                            "importer.binding ext='.{}' id='{}' type='{}' priority={}",
-                            b.ext,
-                            b.stable_id,
-                            b.output_type_id,
-                            b.priority.0
-                        );
-                    }
-                }
-            }
-        }
+        // Note: This can run before the logger module is initialized; it is still useful
+        // for early diagnostics when logs are available.
+        self.log_importer_registry("after plugins load");
 
         Ok(())
+    }
+
+    fn log_importer_registry(&self, tag: &'static str) {
+        let Some(am) = self.resources.get::<crate::assets::AssetManager>() else {
+            log::debug!(target: "assets", "importer.registry skipped (AssetManager missing) tag={}", tag);
+            return;
+        };
+
+        let bindings = am.store().importer_bindings();
+
+        if bindings.is_empty() {
+            log::info!(target: "assets", "importer.registry empty (no bindings) tag={}", tag);
+            log::info!(target: "assets", "importer.formats readable=<none> tag={}", tag);
+            return;
+        }
+
+        log::info!(
+            target: "assets",
+            "importer.registry bindings={} (tag={})",
+            bindings.len(),
+            tag
+        );
+
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut exts: BTreeSet<String> = BTreeSet::new();
+        let mut by_ext: BTreeMap<String, Vec<&_>> = BTreeMap::new();
+
+        for b in bindings.iter() {
+            let ext = format!(".{}", b.ext.trim_start_matches('.').to_ascii_lowercase());
+            exts.insert(ext.clone());
+            by_ext.entry(ext).or_default().push(b);
+        }
+
+        let formats_line = exts.iter().cloned().collect::<Vec<_>>().join(", ");
+        log::info!(target: "assets", "importer.formats readable=[{}] (tag={})", formats_line, tag);
+
+        for (ext, list) in by_ext.iter() {
+            let mut uniq: BTreeSet<String> = BTreeSet::new();
+            for b in list.iter() {
+                uniq.insert(format!(
+                    "id='{}' type='{}' prio={}",
+                    b.stable_id, b.output_type_id, b.priority.0
+                ));
+            }
+            let providers = uniq.into_iter().collect::<Vec<_>>().join("; ");
+            log::info!(target: "assets", "importer.format {} -> {} (tag={})", ext, providers, tag);
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            for b in bindings {
+                log::debug!(
+                    target: "assets",
+                    "importer.binding ext='.{}' id='{}' type='{}' priority={}",
+                    b.ext,
+                    b.stable_id,
+                    b.output_type_id,
+                    b.priority.0
+                );
+            }
+        }
+    }
+
+    fn log_plugins_diagnostics(&self, tag: &'static str) {
+        let mut list: Vec<(String, String)> = Vec::new();
+        for p in self.plugins.iter() {
+            let info = p.info();
+            list.push((info.id.to_string(), info.version.to_string()));
+        }
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+
+        log::info!("plugins: diagnostics tag='{}' loaded={}", tag, list.len());
+
+        for (i, (id, ver)) in list.iter().enumerate() {
+            log::info!(
+                "plugins: diag [{:02}/{:02}] id='{}' ver='{}'",
+                i.saturating_add(1),
+                list.len().max(1),
+                id,
+                ver
+            );
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            for p in self.plugins.iter() {
+                let info = p.info();
+                log::debug!(
+                    "plugins: diag.debug id='{}' ver='{}' info={:?}",
+                    info.id,
+                    info.version,
+                    info
+                );
+            }
+        }
     }
 
     pub fn start(&mut self) -> EngineResult<()> {
@@ -428,10 +461,7 @@ impl<E: Send + 'static> Engine<E> {
         }
 
         #[inline]
-        fn shutdown_modules<E: Send + 'static>(
-            engine: &mut Engine<E>,
-            modules: &mut [Box<dyn Module<E>>],
-        ) {
+        fn shutdown_modules<E: Send + 'static>(engine: &mut Engine<E>, modules: &mut [Box<dyn Module<E>>]) {
             for m in modules.iter_mut().rev() {
                 let mut ctx = ModuleCtx::new(
                     engine.services.as_ref(),
@@ -465,11 +495,7 @@ impl<E: Send + 'static> Engine<E> {
 
             if let Err(err) = init_result {
                 shutdown_modules(self, &mut sorted[..initialized]);
-                return Err(EngineError::with_module_stage(
-                    sorted[i].id(),
-                    ModuleStage::Init,
-                    err,
-                ));
+                return Err(EngineError::with_module_stage(sorted[i].id(), ModuleStage::Init, err));
             }
 
             initialized = initialized.saturating_add(1);
@@ -479,6 +505,9 @@ impl<E: Send + 'static> Engine<E> {
                 shutdown_modules(self, &mut sorted[..initialized]);
                 self.modules = sorted;
                 self.module_ids = self.modules.iter().map(|mm| mm.id()).collect();
+                if crate::console::take_exit_requested() {
+                    self.exit_requested = true;
+                }
                 return Err(EngineError::ExitRequested);
             }
         }
@@ -501,11 +530,7 @@ impl<E: Send + 'static> Engine<E> {
 
             if let Err(err) = start_result {
                 shutdown_modules(self, &mut sorted[..initialized]);
-                return Err(EngineError::with_module_stage(
-                    sorted[i].id(),
-                    ModuleStage::Start,
-                    err,
-                ));
+                return Err(EngineError::with_module_stage(sorted[i].id(), ModuleStage::Start, err));
             }
 
             self.propagate_shutdown_request();
@@ -529,6 +554,7 @@ impl<E: Send + 'static> Engine<E> {
         si.log();
 
         // IMPORTANT: plugins are loaded after modules start, so the logger module is already installed.
+        // If plugins were loaded earlier (e.g. for UI markup), this is a cheap no-op.
         self.try_load_plugins_once()?;
 
         // Register/announce loaded plugins (stable, readable logging)
@@ -554,12 +580,7 @@ impl<E: Send + 'static> Engine<E> {
             );
         }
 
-        Self::log_phase_ok(
-            "plugins",
-            phase,
-            Some(list.len()),
-            Self::elapsed_since(t_reg0),
-        );
+        Self::log_phase_ok("plugins", phase, Some(list.len()), Self::elapsed_since(t_reg0));
 
         // Start plugins
         let phase = "start_all";
@@ -570,16 +591,12 @@ impl<E: Send + 'static> Engine<E> {
             return Err(Self::phase_err(phase, Self::elapsed_since(t_start0), e));
         }
 
-        Self::log_phase_ok(
-            "plugins",
-            phase,
-            Some(list.len()),
-            Self::elapsed_since(t_start0),
-        );
+        Self::log_phase_ok("plugins", phase, Some(list.len()), Self::elapsed_since(t_start0));
 
-        //self.smoke_test_load_text("text/hello.txt")?;
-        //self.smoke_test_load_json("text/test.json")?;
-
+        // Rich diagnostics after logger is installed and plugins are started.
+        // This keeps logs stable even if plugins/importers were loaded before Engine::start().
+        self.log_plugins_diagnostics("post_start");
+        self.log_importer_registry("post_start");
 
         Ok(())
     }
@@ -634,14 +651,10 @@ impl<E: Send + 'static> Engine<E> {
             };
 
             if let Err(e) = self.plugins.fixed_update_all(self.fixed_dt) {
-                return Err(EngineError::Other(format!(
-                    "plugins: fixed_update failed: {e}"
-                )));
+                return Err(EngineError::Other(format!("plugins: fixed_update failed: {e}")));
             }
 
-            self.run_stage(&fixed_frame, ModuleStage::FixedUpdate, |m, ctx| {
-                m.fixed_update(ctx)
-            })?;
+            self.run_stage(&fixed_frame, ModuleStage::FixedUpdate, |m, ctx| m.fixed_update(ctx))?;
         }
 
         let frame = Frame {
@@ -666,6 +679,7 @@ impl<E: Send + 'static> Engine<E> {
 
         self.scheduler.end_frame(Duration::from_secs_f32(dt));
         self.frame_index = self.frame_index.wrapping_add(1);
+
         if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
             am.pump();
         }
@@ -673,9 +687,7 @@ impl<E: Send + 'static> Engine<E> {
         Ok(frame)
     }
 
-    #[deprecated(
-        note = "Use Engine::emit(...) + EventHub subscriptions instead of synchronous fan-out"
-    )]
+    #[deprecated(note = "Use Engine::emit(...) + EventHub subscriptions instead of synchronous fan-out")]
     pub fn dispatch_external_event(&mut self, event: &dyn Any) -> EngineResult<()> {
         self.sync_shutdown_state();
         if self.is_exit_requested() {
@@ -701,8 +713,7 @@ impl<E: Send + 'static> Engine<E> {
             }
 
             let module_id = m.id();
-            let mut ctx =
-                ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
+            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
 
             #[allow(deprecated)]
             m.on_external_event(&mut ctx, event).map_err(|e| {
@@ -773,8 +784,7 @@ impl<E: Send + 'static> Engine<E> {
 
             let module_id = m.id();
 
-            let mut ctx =
-                ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
+            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
             ctx.set_frame(frame);
 
             call(m.as_mut(), &mut ctx)

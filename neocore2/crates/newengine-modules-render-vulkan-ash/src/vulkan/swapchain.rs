@@ -22,8 +22,9 @@ pub(super) fn create_swapchain(
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
     }?;
 
-    let formats =
-        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }?;
+    let formats = unsafe {
+        surface_loader.get_physical_device_surface_formats(physical_device, surface)
+    }?;
 
     let present_modes = unsafe {
         surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
@@ -155,9 +156,7 @@ impl VulkanRenderer {
 
         if format_changed {
             if self.pipelines.tri_pipeline != vk::Pipeline::null() {
-                self.core
-                    .device
-                    .destroy_pipeline(self.pipelines.tri_pipeline, None);
+                self.core.device.destroy_pipeline(self.pipelines.tri_pipeline, None);
                 self.pipelines.tri_pipeline = vk::Pipeline::null();
             }
             if self.pipelines.tri_pipeline_layout != vk::PipelineLayout::null() {
@@ -181,9 +180,7 @@ impl VulkanRenderer {
             }
 
             if self.pipelines.ui_pipeline != vk::Pipeline::null() {
-                self.core
-                    .device
-                    .destroy_pipeline(self.pipelines.ui_pipeline, None);
+                self.core.device.destroy_pipeline(self.pipelines.ui_pipeline, None);
                 self.pipelines.ui_pipeline = vk::Pipeline::null();
             }
             if self.pipelines.ui_pipeline_layout != vk::PipelineLayout::null() {
@@ -194,15 +191,12 @@ impl VulkanRenderer {
             }
 
             if self.pipelines.render_pass != vk::RenderPass::null() {
-                self.core
-                    .device
-                    .destroy_render_pass(self.pipelines.render_pass, None);
+                self.core.device.destroy_render_pass(self.pipelines.render_pass, None);
                 self.pipelines.render_pass = vk::RenderPass::null();
             }
 
             self.swapchain.format = new_format;
-            self.pipelines.render_pass =
-                create_render_pass(&self.core.device, self.swapchain.format)?;
+            self.pipelines.render_pass = create_render_pass(&self.core.device, self.swapchain.format)?;
 
             let (pl, p) = create_pipeline(&self.core.device, self.pipelines.render_pass)?;
             self.pipelines.tri_pipeline_layout = pl;
@@ -238,9 +232,7 @@ impl VulkanRenderer {
             new_extent,
         )?;
 
-        if self.frames.command_pool != vk::CommandPool::null()
-            && !self.frames.command_buffers.is_empty()
-        {
+        if self.frames.command_pool != vk::CommandPool::null() && !self.frames.command_buffers.is_empty() {
             self.core
                 .device
                 .free_command_buffers(self.frames.command_pool, &self.frames.command_buffers);

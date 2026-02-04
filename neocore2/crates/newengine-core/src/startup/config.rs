@@ -210,4 +210,22 @@ impl StartupLoadReport {
     pub fn used_file(&self) -> Option<&Path> {
         self.file.as_deref()
     }
+
+    /// Prints a deterministic, greppable startup report to stdout.
+    ///
+    /// This is intentionally IO-only (no logging dependency) so apps can call it
+    /// before the logger module is registered.
+    #[inline]
+    pub fn print_to_stdout(&self) {
+        println!(
+            "startup: loaded source={:?} file={:?} resolved_from={:?} overrides={}",
+            self.source,
+            self.file,
+            self.resolved_from,
+            self.overrides.len()
+        );
+        for ov in self.overrides.iter() {
+            println!("startup: override {}: '{}' -> '{}'", ov.key, ov.from, ov.to);
+        }
+    }
 }

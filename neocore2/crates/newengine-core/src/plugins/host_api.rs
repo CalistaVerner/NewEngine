@@ -5,7 +5,7 @@ use newengine_plugin_api::{
     Blob, CapabilityId, EventSinkV1Dyn, HostApiV1, MethodName, ServiceV1Dyn,
 };
 use std::cell::Cell;
-
+use std::sync::Arc;
 use crate::plugins::describe::is_asset_importer;
 use crate::plugins::host_context::ctx;
 use crate::plugins::importer::try_auto_register_importer;
@@ -66,7 +66,8 @@ pub(crate) fn host_register_service_impl(
             )));
         }
 
-        g.insert(service_id.clone(), svc);
+        g.insert(service_id.clone(), Arc::from(svc));
+        crate::plugins::host_context::bump_services_generation();
     }
 
     if auto_register_importer {

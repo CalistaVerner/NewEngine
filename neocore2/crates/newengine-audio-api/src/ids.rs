@@ -1,41 +1,41 @@
-#![forbid(unsafe_op_in_unsafe_fn)]
-#![deny(rust_2018_idioms)]
-#![allow(clippy::needless_return)]
+use bytemuck::{Pod, Zeroable};
 
-pub mod ids;
-pub mod math;
-pub mod types;
+#[cfg(feature = "abi")]
+use abi_stable::StableAbi;
 
-pub mod ambience;
-pub mod environment;
-pub mod mixer;
-pub mod music;
-pub mod occlusion;
-pub mod system;
-pub mod vehicle;
-pub mod voice;
+#[repr(transparent)]
+#[cfg_attr(feature = "abi", derive(StableAbi))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Zeroable, Pod)]
+pub struct AudioEntityId(pub u64);
 
-pub mod audio_api;
-pub mod capability;
+impl AudioEntityId {
+    #[inline]
+    pub const fn invalid() -> Self {
+        Self(0)
+    }
 
-// ServiceV1 wire protocol (method names + POD payloads).
-pub mod protocol;
-pub mod wire;
-
-pub mod prelude {
-    pub use crate::ambience::*;
-    pub use crate::audio_api::*;
-    pub use crate::capability::*;
-    pub use crate::environment::*;
-    pub use crate::ids::*;
-    pub use crate::math::*;
-    pub use crate::mixer::*;
-    pub use crate::music::*;
-    pub use crate::occlusion::*;
-    pub use crate::protocol::*;
-    pub use crate::system::*;
-    pub use crate::types::*;
-    pub use crate::vehicle::*;
-    pub use crate::voice::*;
-    pub use crate::wire::*;
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 != 0
+    }
 }
+
+#[repr(transparent)]
+#[cfg_attr(feature = "abi", derive(StableAbi))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Zeroable, Pod)]
+pub struct AudioBusId(pub u32);
+
+#[repr(transparent)]
+#[cfg_attr(feature = "abi", derive(StableAbi))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Zeroable, Pod)]
+pub struct AudioEventId(pub u32);
+
+#[repr(transparent)]
+#[cfg_attr(feature = "abi", derive(StableAbi))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Zeroable, Pod)]
+pub struct AudioSnapshotId(pub u32);
+
+#[repr(transparent)]
+#[cfg_attr(feature = "abi", derive(StableAbi))]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash, Zeroable, Pod)]
+pub struct AudioTagId(pub u32);

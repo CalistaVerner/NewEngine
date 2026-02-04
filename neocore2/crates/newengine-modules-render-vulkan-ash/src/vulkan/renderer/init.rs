@@ -10,6 +10,7 @@ use super::state::{
     CoreContext, DebugState, FrameManager, PipelinePack, SwapchainContext, TextOverlayResources,
     UiOverlayResources, VulkanRenderer,
 };
+#[warn(unused_imports)]
 use super::types::{FrameSync, FRAMES_IN_FLIGHT};
 
 use super::super::device::*;

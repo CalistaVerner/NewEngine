@@ -1,3 +1,5 @@
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 use newengine_core::host_events::{
     HostEvent, InputHostEvent, KeyCode, KeyState, MouseButton, TextHostEvent, WindowHostEvent,
 };
@@ -15,9 +17,9 @@ use winit::{
 };
 
 use newengine_ui::draw::UiDrawList;
-use newengine_ui::{
-    create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions,
-};
+use newengine_ui::{create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions};
+
+use std::time::Instant;
 
 /// Window placement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +59,6 @@ impl Default for WinitAppConfig {
 
 /// Engine-thread local window handles (not Send/Sync on some platforms).
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct WinitWindowHandles {
     pub window: RawWindowHandle,
     pub display: RawDisplayHandle,
@@ -87,6 +88,9 @@ where
 
     ui: Box<dyn UiProvider>,
     ui_build: Option<Box<dyn UiBuildFn>>,
+
+    last_frame_instant: Option<Instant>,
+    shutting_down: bool,
 }
 
 impl<E, F> App<E, F>
@@ -131,14 +135,13 @@ where
             last_cursor_pos: None,
             ui,
             ui_build,
+            last_frame_instant: None,
+            shutting_down: false,
         }
     }
 
     #[inline]
-    fn build_window_attributes(
-        event_loop: &ActiveEventLoop,
-        config: &WinitAppConfig,
-    ) -> WindowAttributes {
+    fn build_window_attributes(event_loop: &ActiveEventLoop, config: &WinitAppConfig) -> WindowAttributes {
         let (width, height) = config.size;
         let mut attrs = WindowAttributes::default()
             .with_title(config.title.clone())
@@ -160,10 +163,8 @@ where
                 let ms = monitor.size();
                 let mp = monitor.position();
 
-                let cx =
-                    mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
-                let cy =
-                    mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
+                let cx = mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
+                let cy = mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
 
                 attrs = attrs.with_position(PhysicalPosition::new(
                     cx.saturating_add(ox),
@@ -182,11 +183,6 @@ where
     }
 
     #[inline]
-    fn exit(event_loop: &ActiveEventLoop) {
-        event_loop.exit();
-    }
-
-    #[inline]
     fn window_size(&self) -> Option<(u32, u32)> {
         self.window.as_ref().map(|w| {
             let PhysicalSize { width, height } = w.inner_size();
@@ -202,10 +198,7 @@ where
 
         let _ = self
             .engine
-            .emit(HostEvent::Window(WindowHostEvent::Resized {
-                width,
-                height,
-            }));
+            .emit(HostEvent::Window(WindowHostEvent::Resized { width, height }));
     }
 
     fn install_window_handles_resource(&mut self) {
@@ -344,10 +337,41 @@ where
         }
     }
 
+    #[inline]
+    fn frame_dt_seconds(&mut self) -> f32 {
+        let now = Instant::now();
+        let dt = match self.last_frame_instant.replace(now) {
+            Some(prev) => now.duration_since(prev).as_secs_f32(),
+            None => 0.0,
+        };
+        dt
+    }
+
     fn set_fatal_and_exit(&mut self, event_loop: &ActiveEventLoop, e: EngineError) {
         log::error!("winit host fatal: {e}");
         self.fatal = Some(e);
-        Self::exit(event_loop);
+        self.shutdown_and_exit(event_loop);
+    }
+
+    fn shutdown_and_exit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shutting_down {
+            event_loop.exit();
+            return;
+        }
+
+        self.shutting_down = true;
+
+        let _ = self
+            .engine
+            .emit(HostEvent::Window(WindowHostEvent::CloseRequested));
+
+        let _ = self.engine.request_exit();
+
+        if let Err(e) = self.engine.shutdown() {
+            log::error!("engine.shutdown failed: {e}");
+        }
+
+        event_loop.exit();
     }
 }
 
@@ -384,6 +408,7 @@ where
                 return;
             }
             self.started = true;
+            self.last_frame_instant = Some(Instant::now());
         }
 
         self.emit_ready();
@@ -397,10 +422,7 @@ where
 
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Window(WindowHostEvent::CloseRequested));
-                Self::exit(event_loop);
+                self.shutdown_and_exit(event_loop);
                 return;
             }
 
@@ -434,7 +456,7 @@ where
                 }));
 
                 if code == KeyCode::Escape && state == KeyState::Pressed {
-                    Self::exit(event_loop);
+                    self.shutdown_and_exit(event_loop);
                     return;
                 }
 
@@ -443,8 +465,6 @@ where
                         let _ = self.engine.emit(HostEvent::Text(TextHostEvent::Char(ch)));
                     }
                 }
-
-                let _ = &event.logical_key;
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -469,6 +489,7 @@ where
             WindowEvent::CursorMoved { position, .. } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
+
                 if let Some((px, py)) = self.last_cursor_pos {
                     let _ = self
                         .engine
@@ -477,7 +498,9 @@ where
                             dy: y - py,
                         }));
                 }
+
                 self.last_cursor_pos = Some((x, y));
+
                 let _ = self
                     .engine
                     .emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
@@ -494,8 +517,7 @@ where
                         .engine
                         .emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
                 }
-                Ime::Enabled => {}
-                Ime::Disabled => {}
+                Ime::Enabled | Ime::Disabled => {}
             },
 
             _ => {}
@@ -506,27 +528,33 @@ where
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.fatal.is_some() {
-            Self::exit(event_loop);
+            self.shutdown_and_exit(event_loop);
             return;
         }
+
+        if self.shutting_down {
+            event_loop.exit();
+            return;
+        }
+
         if !self.started {
             self.request_redraw();
             return;
         }
 
+        let dt = self.frame_dt_seconds();
+
         if let (Some(w), Some(build)) = (self.window.as_ref(), self.ui_build.as_deref_mut()) {
-            let out = self.ui.run_frame(w, UiFrameDesc::new(0.0), build);
-            self.engine
-                .resources_mut()
-                .insert::<UiDrawList>(out.draw_list);
+            let out = self.ui.run_frame(w, UiFrameDesc::new(dt), build);
+            self.engine.resources_mut().insert::<UiDrawList>(out.draw_list);
         }
 
         match self.engine.step() {
             Ok(_) => self.request_redraw(),
-            Err(EngineError::ExitRequested) => Self::exit(event_loop),
+            Err(EngineError::ExitRequested) => self.shutdown_and_exit(event_loop),
             Err(e) => {
                 log::error!("engine.step failed: {e}");
-                Self::exit(event_loop)
+                self.shutdown_and_exit(event_loop);
             }
         }
     }

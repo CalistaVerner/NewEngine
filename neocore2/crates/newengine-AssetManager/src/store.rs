@@ -498,3 +498,131 @@ pub fn preview_single_line_escaped(s: &str, max_chars: usize) -> String {
 
     out
 }
+
+#[derive(Debug, Clone)]
+pub struct AssetStoreStats {
+    pub sources: usize,
+    pub importers: usize,
+    pub importers_bindings: usize,
+    pub state_entries: usize,
+    pub blobs_ready: usize,
+    pub blobs_bytes: u64,
+    pub queue_len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetEntrySnapshot {
+    pub id_u128: u128,
+    pub path: String,
+    pub state: String,
+    pub type_id: Option<String>,
+    pub format: Option<String>,
+    pub bytes: Option<u64>,
+}
+
+impl AssetStore {
+    /// Returns a snapshot of basic store statistics for console/UI.
+    pub fn stats_snapshot(&self) -> AssetStoreStats {
+        let g = self.inner.lock();
+
+        let sources = g.sources.len();
+        let importers = g.importers_by_ext.values().map(|v| v.len()).sum::<usize>();
+        let importers_bindings = g
+            .importers_by_ext
+            .iter()
+            .map(|(k, v)| (k.len(), v.len()))
+            .count();
+
+        let state_entries = g.state.len();
+        let blobs_ready = g.blobs.len();
+        let blobs_bytes = g
+            .blobs
+            .values()
+            .map(|b| b.payload.len() as u64)
+            .sum::<u64>();
+
+        let queue_len = g.queue.len();
+
+        AssetStoreStats {
+            sources,
+            importers,
+            importers_bindings,
+            state_entries,
+            blobs_ready,
+            blobs_bytes,
+            queue_len,
+        }
+    }
+
+    /// Lists assets currently known to the store (state map), limited by `limit`.
+    /// Intended for console/UI; avoids exposing internal types.
+    pub fn list_snapshot(&self, limit: usize) -> Vec<AssetEntrySnapshot> {
+        let g = self.inner.lock();
+
+        let mut out = Vec::new();
+        out.reserve(g.state.len().min(limit));
+
+        for (id, st) in g.state.iter().take(limit) {
+            let id_u128 = id.to_u128();
+
+            let (type_id, format, bytes) = match g.blobs.get(id) {
+                Some(blob) => (
+                    Some(blob.type_id.to_string()),
+                    Some(blob.format.to_string()),
+                    Some(blob.payload.len() as u64),
+                ),
+                None => (None, None, None),
+            };
+
+            let state_str = match st {
+                crate::types::AssetState::Unloaded => "unloaded".to_string(),
+                crate::types::AssetState::Loading => "loading".to_string(),
+                crate::types::AssetState::Ready => "ready".to_string(),
+                crate::types::AssetState::Failed(e) => format!("failed: {}", e),
+            };
+
+            // Path is not stored in the state map. We can only show id-based entry here.
+            // The canonical path is available at load-time via AssetKey, but not retained.
+            // For console use, we support list by id and state; path is available via commands like asset.load/reload.
+            out.push(AssetEntrySnapshot {
+                id_u128,
+                path: String::new(),
+                state: state_str,
+                type_id,
+                format,
+                bytes,
+            });
+        }
+
+        out
+    }
+
+    /// Convenience: enqueue load by logical path with settings_hash=0.
+    pub fn load_path(&self, logical_path: &str) -> Result<crate::id::AssetId, crate::types::AssetError> {
+        let key = AssetKey::new(logical_path, 0);
+        self.load(key)
+    }
+
+    /// Convenience: attempt "reload" semantics:
+    /// - mark asset Unloaded and drop cached blob (if any)
+    /// - enqueue new load
+    pub fn reload_path(&self, logical_path: &str) -> Result<crate::id::AssetId, crate::types::AssetError> {
+        let key = AssetKey::new(logical_path, 0);
+        let id = key.id();
+
+        {
+            let mut g = self.inner.lock();
+            g.blobs.remove(&id);
+            g.state.insert(id, crate::types::AssetState::Unloaded);
+        }
+
+        self.load(key)
+    }
+
+    /// Returns the current queue length (for console/UI).
+    #[inline]
+    pub fn queue_len(&self) -> usize {
+        let g = self.inner.lock();
+        g.queue.len()
+    }
+}

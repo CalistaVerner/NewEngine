@@ -1,5 +1,5 @@
 use crate::id::AssetId;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

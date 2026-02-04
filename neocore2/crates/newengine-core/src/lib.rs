@@ -12,6 +12,13 @@ mod system_info;
 pub mod render;
 pub mod startup;
 pub mod assets;
+pub mod assets_service;
+pub mod console;
+
+pub mod host_services;
+
+pub use host_services::{call_service_v1, list_service_ids, describe_service};
+
 pub use assets::{AssetManager, AssetManagerConfig};
 
 
