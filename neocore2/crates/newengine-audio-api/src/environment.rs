@@ -1,20 +1,26 @@
-#[cfg(feature = "abi")]
-use abi_stable::{sabi_trait, StableAbi};
+use crate::math::Vec3f;
 
-/// Global acoustic environment parameters (simple reverb-like model).
-/// Backends can map this to their own reverb buses / sends.
+#[cfg(feature = "abi")]
+use abi_stable::{sabi_trait, std_types::RBox, StableAbi};
+
 #[repr(C)]
 #[cfg_attr(feature = "abi", derive(StableAbi))]
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
-pub struct EnvironmentDesc {
-    pub reverb_room: f32,
-    pub reverb_decay: f32,
-    pub reverb_damping: f32,
-    pub hf_reference: f32,
-    pub wet: f32,
+pub struct ReverbZoneDesc {
+    pub center: Vec3f,
+    pub extents: Vec3f,
+    pub wetness: f32,
+    pub room_size: f32,
+    pub decay_time: f32,
 }
 
 #[cfg_attr(feature = "abi", sabi_trait)]
 pub trait AudioEnvironmentV1: Send + Sync {
-    fn set_environment(&self, env: EnvironmentDesc);
+    fn set_reverb_zone(&self, zone: ReverbZoneDesc);
 }
+
+#[cfg(feature = "abi")]
+pub type AudioEnvironmentV1Dyn<'a> = AudioEnvironmentV1_TO<'a, RBox<()>>;
+
+#[cfg(not(feature = "abi"))]
+pub type AudioEnvironmentV1Dyn<'a> = &'a dyn AudioEnvironmentV1;

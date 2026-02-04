@@ -18,7 +18,6 @@ pub(crate) struct GpuUiTexture {
     pub(crate) mem: vk::DeviceMemory,
     pub(crate) view: vk::ImageView,
     pub(crate) desc_set: vk::DescriptorSet,
-    pub(crate) size: [u32; 2],
 }
 
 impl VulkanRenderer {
@@ -442,7 +441,6 @@ impl VulkanRenderer {
             mem,
             view,
             desc_set,
-            size,
         };
 
         self.ui.textures.insert(id.0, gpu);

@@ -12,6 +12,13 @@ mod system_info;
 pub mod render;
 pub mod startup;
 pub mod assets;
+pub mod assets_service;
+pub mod console;
+
+pub mod host_services;
+
+pub use host_services::{call_service_v1, describe_service, list_service_ids};
+
 pub use assets::{AssetManager, AssetManagerConfig};
 
 
@@ -35,8 +42,8 @@ pub use startup::{
     StartupConfig,
     StartupConfigSource,
     StartupLoadReport,
+    StartupLoader,
     StartupOverride,
     StartupResolvedFrom,
-    StartupLoader,
     WindowPlacement,
 };

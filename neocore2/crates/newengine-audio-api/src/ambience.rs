@@ -1,10 +1,7 @@
 use crate::math::Vec3f;
 
 #[cfg(feature = "abi")]
-use abi_stable::StableAbi;
-
-#[cfg(feature = "abi")]
-use abi_stable::sabi_trait;
+use abi_stable::{sabi_trait, std_types::RBox, StableAbi};
 
 #[repr(C)]
 #[cfg_attr(feature = "abi", derive(StableAbi))]
@@ -30,3 +27,9 @@ pub trait AmbienceSystemV1: Send + Sync {
     fn set_zone(&self, zone: AmbienceZoneDesc);
     fn set_directional(&self, desc: DirectionalAmbienceDesc);
 }
+
+#[cfg(feature = "abi")]
+pub type AmbienceSystemV1Dyn<'a> = AmbienceSystemV1_TO<'a, RBox<()>>;
+
+#[cfg(not(feature = "abi"))]
+pub type AmbienceSystemV1Dyn<'a> = &'a dyn AmbienceSystemV1;

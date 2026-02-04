@@ -1,8 +1,8 @@
 use crate::error::{EngineError, EngineResult};
 use crate::module::{ApiProvide, ApiVersion};
 
-use parking_lot::{Mutex, MutexGuard};
 use newengine_ui::draw::UiDrawList;
+use parking_lot::{Mutex, MutexGuard};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -552,7 +552,6 @@ impl BindGroupDesc {
 
 pub trait RenderApi: Send {
     fn begin_frame(&mut self, desc: BeginFrameDesc) -> EngineResult<()>;
-    #[inline]
     fn set_ui_draw_list(&mut self, ui: UiDrawList);
     fn end_frame(&mut self) -> EngineResult<()>;
     fn resize(&mut self, width: u32, height: u32) -> EngineResult<()>;

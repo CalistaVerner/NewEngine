@@ -36,9 +36,7 @@ impl Drop for VulkanRenderer {
                         &self.frames.command_buffers,
                     );
                 }
-                self.core
-                    .device
-                    .destroy_command_pool(self.frames.command_pool, None);
+                self.core.device.destroy_command_pool(self.frames.command_pool, None);
                 self.frames.command_pool = vk::CommandPool::null();
             }
 
@@ -56,9 +54,10 @@ impl Drop for VulkanRenderer {
                 self.pipelines.tri_pipeline = vk::Pipeline::null();
             }
             if self.pipelines.tri_pipeline_layout != vk::PipelineLayout::null() {
-                self.core
-                    .device
-                    .destroy_pipeline_layout(self.pipelines.tri_pipeline_layout, None);
+                self.core.device.destroy_pipeline_layout(
+                    self.pipelines.tri_pipeline_layout,
+                    None,
+                );
                 self.pipelines.tri_pipeline_layout = vk::PipelineLayout::null();
             }
 

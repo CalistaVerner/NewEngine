@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use std::{borrow::Cow, thread};
 
 use ahash::AHashMap;
+use smallvec::SmallVec;
+
 use roxmltree::{Document, Node};
 
 use newengine_assets::{AssetKey, AssetState, AssetStore, TextReader};
@@ -35,12 +37,35 @@ impl std::fmt::Display for UiMarkupError {
 
 impl std::error::Error for UiMarkupError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiEventKind {
+    Click,
+    Change,
+    Submit,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiEvent {
+    pub kind: UiEventKind,
+    pub target_id: String,
+    pub value: Option<String>,
+    pub actions: SmallVec<[String; 2]>,
+}
+
 /// Runtime state for UI bindings and events.
+///
+/// Contract principles:
+/// - `clicked` stays for back-compat (existing code).
+/// - `events` is the canonical "reactive" stream for XML actions.
+/// - `vars` remains for $var substitution and value mirroring.
 #[derive(Debug, Default)]
 pub struct UiState {
     pub strings: AHashMap<String, String>,
     pub clicked: AHashMap<String, bool>,
     pub vars: AHashMap<String, String>,
+    pub unknown_tags: AHashMap<String, u32>,
+
+    events: Vec<UiEvent>,
 }
 
 impl UiState {
@@ -53,12 +78,73 @@ impl UiState {
     pub fn set_var(&mut self, k: impl Into<String>, v: impl Into<String>) {
         self.vars.insert(k.into(), v.into());
     }
+
+    /// Drain UI events produced by declarative XML `on_*` actions.
+    #[inline]
+    pub fn drain_events(&mut self) -> Vec<UiEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    #[inline]
+    fn push_event(&mut self, ev: UiEvent) {
+        self.events.push(ev);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiVisuals {
+    Auto,
+    Dark,
+    Light,
+}
+
+impl Default for UiVisuals {
+    #[inline]
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiDensity {
+    Default,
+    Compact,
+    Dense,
+    Tight,
+}
+
+impl Default for UiDensity {
+    #[inline]
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UiThemeDesc {
+    pub visuals: UiVisuals,
+    pub scale: f32,
+    pub font_size: f32,
+    pub density: UiDensity,
+}
+
+impl Default for UiThemeDesc {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            visuals: UiVisuals::Auto,
+            scale: 1.0,
+            font_size: 14.0,
+            density: UiDensity::Default,
+        }
+    }
 }
 
 /// Parsed UI document.
 #[derive(Debug, Clone)]
 pub struct UiMarkupDoc {
     root: UiNode,
+    theme: UiThemeDesc,
 }
 
 impl UiMarkupDoc {
@@ -81,12 +167,16 @@ impl UiMarkupDoc {
             .map_err(|e| UiMarkupError::Enqueue(e.to_string()))?;
 
         let t0 = Instant::now();
+
+        // Backoff: keep calling pump() every iteration, but avoid a pure hot spin.
+        let mut spin: u32 = 0;
+
         loop {
             pump();
 
             match store.state(id) {
                 AssetState::Ready => break,
-                AssetState::Failed(msg) => return Err(UiMarkupError::Failed(msg.parse().unwrap())),
+                AssetState::Failed(msg) => return Err(UiMarkupError::Failed(msg.to_string())),
                 AssetState::Loading | AssetState::Unloaded => {}
             }
 
@@ -96,7 +186,14 @@ impl UiMarkupDoc {
                 });
             }
 
-            thread::yield_now();
+            spin = spin.saturating_add(1);
+            if spin < 32 {
+                thread::yield_now();
+            } else if spin < 128 {
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                thread::sleep(Duration::from_millis(3));
+            }
         }
 
         let blob = store.get_blob(id).ok_or(UiMarkupError::BlobMissing)?;
@@ -104,16 +201,29 @@ impl UiMarkupDoc {
         let doc = TextReader::from_blob_parts(&blob.meta_json, &blob.payload)
             .map_err(|e| UiMarkupError::TextRead(e.to_string()))?;
 
-        let parsed =
-            Document::parse(&doc.text).map_err(|e| UiMarkupError::XmlParse(e.to_string()))?;
-
-        let ui = parse_ui_root(&parsed).map_err(UiMarkupError::Invalid)?;
-
-        Ok(Self { root: ui })
+        Self::parse(&doc.text)
     }
 
+    pub fn parse(xml_text: &str) -> Result<Self, UiMarkupError> {
+        let parsed =
+            Document::parse(xml_text).map_err(|e| UiMarkupError::XmlParse(e.to_string()))?;
+
+        let root = parse_ui_root(&parsed).map_err(UiMarkupError::Invalid)?;
+        let theme = parse_theme(&parsed);
+
+        Ok(Self { root, theme })
+    }
+
+    /// Render UI into egui (only when `feature="egui"` is enabled).
+    #[cfg(feature = "egui")]
     pub fn render(&self, ctx: &egui::Context, state: &mut UiState) {
+        apply_theme(ctx, &self.theme);
         self.root.render(ctx, state);
+    }
+
+    #[inline]
+    pub fn theme(&self) -> &UiThemeDesc {
+        &self.theme
     }
 }
 
@@ -144,12 +254,15 @@ enum UiNode {
     Button {
         id: String,
         text: String,
+        on_click: SmallVec<[String; 2]>,
     },
     TextBox {
         id: String,
         hint: String,
         bind: String,
         multiline: bool,
+        on_change: SmallVec<[String; 2]>,
+        on_submit: SmallVec<[String; 2]>,
     },
 
     Spacer,
@@ -161,6 +274,7 @@ enum UiNode {
 }
 
 impl UiNode {
+    #[cfg(feature = "egui")]
     fn render(&self, ctx: &egui::Context, state: &mut UiState) {
         match self {
             UiNode::Ui { children } => {
@@ -194,6 +308,7 @@ impl UiNode {
     }
 }
 
+#[cfg(feature = "egui")]
 fn render_in_ui(node: &UiNode, ui: &mut egui::Ui, state: &mut UiState) {
     match node {
         UiNode::Row { children } => {
@@ -210,37 +325,92 @@ fn render_in_ui(node: &UiNode, ui: &mut egui::Ui, state: &mut UiState) {
                 }
             });
         }
-        UiNode::Label { id: _, text } => {
-            let s = substitute_vars(text, &state.vars);
+        UiNode::Label { id, text } => {
+            let base = if let Some(id) = id.as_deref() {
+                state
+                    .strings
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or(text.as_str())
+            } else {
+                text.as_str()
+            };
+            let s = substitute_vars(base, &state.vars);
             ui.label(s.as_ref());
         }
-        UiNode::Button { id, text } => {
+        UiNode::Button { id, text, on_click } => {
             let s = substitute_vars(text, &state.vars);
             if ui.button(s.as_ref()).clicked() {
+                // Back-compat:
                 state.clicked.insert(id.clone(), true);
+
+                // Declarative actions:
+                if !on_click.is_empty() {
+                    state.push_event(UiEvent {
+                        kind: UiEventKind::Click,
+                        target_id: id.clone(),
+                        value: None,
+                        actions: on_click.clone(),
+                    });
+                }
             }
         }
         UiNode::TextBox {
-            id: _,
+            id,
             hint,
             bind,
             multiline,
+            on_change,
+            on_submit,
         } => {
             let entry = state.strings.entry(bind.clone()).or_default();
             let hint = substitute_vars(hint, &state.vars);
 
-            if *multiline {
-                ui.add(
-                    egui::TextEdit::multiline(entry)
-                        .hint_text(hint.as_ref())
-                        .desired_width(f32::INFINITY),
-                );
-            } else {
-                ui.add(
-                    egui::TextEdit::singleline(entry)
-                        .hint_text(hint.as_ref())
-                        .desired_width(f32::INFINITY),
-                );
+            let (changed, submit_now, value_snapshot) = {
+                let entry = state.strings.entry(bind.clone()).or_default();
+
+                let resp = if *multiline {
+                    ui.add(
+                        egui::TextEdit::multiline(entry)
+                            .hint_text(hint.as_ref())
+                            .desired_width(f32::INFINITY),
+                    )
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(entry)
+                            .hint_text(hint.as_ref())
+                            .desired_width(f32::INFINITY),
+                    )
+                };
+
+                let changed = resp.changed();
+                let submit_now = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                (changed, submit_now, entry.clone())
+            };
+
+            if changed {
+                // Existing behavior:
+                state.vars.insert(id.clone(), value_snapshot.clone());
+
+                // Declarative actions:
+                if !on_change.is_empty() {
+                    state.push_event(UiEvent {
+                        kind: UiEventKind::Change,
+                        target_id: id.clone(),
+                        value: Some(value_snapshot.clone()),
+                        actions: on_change.clone(),
+                    });
+                }
+            }
+
+            if submit_now && !on_submit.is_empty() {
+                state.push_event(UiEvent {
+                    kind: UiEventKind::Submit,
+                    target_id: id.clone(),
+                    value: Some(value_snapshot),
+                    actions: on_submit.clone(),
+                });
             }
         }
         UiNode::Spacer => ui.add_space(8.0),
@@ -257,7 +427,8 @@ fn render_in_ui(node: &UiNode, ui: &mut egui::Ui, state: &mut UiState) {
                 render_in_ui(c, ui, state);
             }
         }
-        UiNode::Unknown { children, .. } => {
+        UiNode::Unknown { tag, children } => {
+            *state.unknown_tags.entry(tag.clone()).or_insert(0) += 1;
             for c in children {
                 render_in_ui(c, ui, state);
             }
@@ -315,6 +486,32 @@ fn parse_ui_root(doc: &Document) -> Result<UiNode, String> {
     })
 }
 
+fn parse_theme(doc: &Document) -> UiThemeDesc {
+    let root = doc.root_element();
+
+    let mut theme = UiThemeDesc::default();
+
+    let visuals = attr_any(root, &["visuals", "theme"]).unwrap_or("auto");
+    theme.visuals = match visuals.trim().to_ascii_lowercase().as_str() {
+        "dark" => UiVisuals::Dark,
+        "light" => UiVisuals::Light,
+        _ => UiVisuals::Auto,
+    };
+
+    theme.scale = attr_f32(root, "scale").unwrap_or(1.0).clamp(0.25, 4.0);
+    theme.font_size = attr_f32(root, "font_size").unwrap_or(14.0).clamp(8.0, 40.0);
+
+    let density = attr_str(root, "density").unwrap_or("default");
+    theme.density = match density.trim().to_ascii_lowercase().as_str() {
+        "compact" => UiDensity::Compact,
+        "dense" => UiDensity::Dense,
+        "tight" => UiDensity::Tight,
+        _ => UiDensity::Default,
+    };
+
+    theme
+}
+
 fn parse_children(parent: Node) -> Result<Vec<UiNode>, String> {
     let mut out = Vec::new();
     for n in parent.children().filter(|n| n.is_element()) {
@@ -365,7 +562,11 @@ fn parse_node(n: Node) -> Result<UiNode, String> {
         "button" => {
             let id = attr(n, "id").ok_or_else(|| "button requires id".to_string())?;
             let text = attr(n, "text").unwrap_or_else(|| "Button".to_string());
-            Ok(UiNode::Button { id, text })
+
+            let mut on_click = SmallVec::<[String; 2]>::new();
+            parse_actions_for(&n, UiEventKind::Click, &mut on_click);
+
+            Ok(UiNode::Button { id, text, on_click })
         }
         "textbox" | "input" => {
             let id = attr(n, "id").unwrap_or_else(|| "textbox".to_string());
@@ -375,11 +576,18 @@ fn parse_node(n: Node) -> Result<UiNode, String> {
                 .map(|v| v == "true" || v == "1" || v == "yes")
                 .unwrap_or(false);
 
+            let mut on_change = SmallVec::<[String; 2]>::new();
+            let mut on_submit = SmallVec::<[String; 2]>::new();
+            parse_actions_for(&n, UiEventKind::Change, &mut on_change);
+            parse_actions_for(&n, UiEventKind::Submit, &mut on_submit);
+
             Ok(UiNode::TextBox {
                 id,
                 hint,
                 bind,
                 multiline,
+                on_change,
+                on_submit,
             })
         }
         "spacer" => Ok(UiNode::Spacer),
@@ -396,4 +604,128 @@ fn attr(n: Node, key: &str) -> Option<String> {
 
 fn attr_opt(n: Node, key: &str) -> Option<String> {
     n.attribute(key).map(|s| s.to_string())
+}
+
+#[inline]
+fn attr_str<'a>(n: Node<'a, 'a>, key: &str) -> Option<&'a str> {
+    n.attribute(key).map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+#[inline]
+fn attr_any<'a>(n: Node<'a, 'a>, keys: &[&str]) -> Option<&'a str> {
+    for k in keys {
+        if let Some(v) = attr_str(n, k) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[inline]
+fn attr_f32(n: Node<'_, '_>, key: &str) -> Option<f32> {
+    attr_str(n, key).and_then(|s| s.parse::<f32>().ok())
+}
+
+/* =============================================================================================
+Declarative actions
+============================================================================================= */
+
+fn parse_actions_for(node: &Node<'_, '_>, kind: UiEventKind, out: &mut SmallVec<[String; 2]>) {
+    // Explicit attrs:
+    match kind {
+        UiEventKind::Click => {
+            if let Some(v) = node.attribute("on_click") {
+                split_actions_into(v, out);
+            }
+        }
+        UiEventKind::Change => {
+            if let Some(v) = node.attribute("on_change") {
+                split_actions_into(v, out);
+            }
+        }
+        UiEventKind::Submit => {
+            if let Some(v) = node.attribute("on_submit") {
+                split_actions_into(v, out);
+            }
+        }
+    }
+
+    // Compact attr:
+    // on="click:a,b; change:c; submit:d"
+    if let Some(v) = node.attribute("on") {
+        for chunk in v.split(';') {
+            let chunk = chunk.trim();
+            if chunk.is_empty() {
+                continue;
+            }
+            let Some((ev, acts)) = chunk.split_once(':') else {
+                continue;
+            };
+            let ev = ev.trim().to_ascii_lowercase();
+            let acts = acts.trim();
+
+            let match_kind = match ev.as_str() {
+                "click" | "on_click" => UiEventKind::Click,
+                "change" | "on_change" => UiEventKind::Change,
+                "submit" | "on_submit" => UiEventKind::Submit,
+                _ => continue,
+            };
+
+            if match_kind == kind {
+                split_actions_into(acts, out);
+            }
+        }
+    }
+}
+
+#[inline]
+fn split_actions_into(s: &str, out: &mut SmallVec<[String; 2]>) {
+    for part in s.split(|c| c == ',' || c == '|') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        out.push(p.to_string());
+    }
+}
+
+/* =============================================================================================
+Theme application (egui only)
+============================================================================================= */
+
+#[cfg(feature = "egui")]
+fn apply_theme(ctx: &egui::Context, theme: &UiThemeDesc) {
+    let mut style = (*ctx.style()).clone();
+
+    match theme.visuals {
+        UiVisuals::Auto => {}
+        UiVisuals::Dark => style.visuals = egui::Visuals::dark(),
+        UiVisuals::Light => style.visuals = egui::Visuals::light(),
+    }
+
+    let s = theme.scale;
+    style.spacing.item_spacing *= s;
+    style.spacing.window_margin *= s;
+    style.spacing.button_padding *= s;
+    style.spacing.indent *= s;
+    style.spacing.interact_size *= s;
+
+    match theme.density {
+        UiDensity::Default => {}
+        UiDensity::Compact => {
+            style.spacing.item_spacing *= 0.85;
+            style.spacing.button_padding *= 0.90;
+        }
+        UiDensity::Dense => {
+            style.spacing.item_spacing *= 0.75;
+            style.spacing.button_padding *= 0.85;
+        }
+        UiDensity::Tight => {
+            style.spacing.item_spacing *= 0.65;
+            style.spacing.button_padding *= 0.80;
+        }
+    }
+
+    style.override_font_id = Some(egui::FontId::proportional(theme.font_size));
+    ctx.set_style(style);
 }

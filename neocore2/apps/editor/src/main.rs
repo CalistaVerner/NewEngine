@@ -11,9 +11,14 @@ use newengine_platform_winit::{
     run_winit_app_with_config, UiBuildFn, WinitAppConfig, WinitWindowPlacement,
 };
 
+use newengine_ui::markup::UiMarkupDoc;
+
+use std::sync::{Arc, Mutex};
+
 mod ui;
 
 const FIXED_DT_MS: u32 = 16;
+const UI_MARKUP_PATH: &str = "ui/editor.xml";
 
 struct AppServices;
 
@@ -45,14 +50,6 @@ fn winit_config_from_startup(startup: &StartupConfig) -> WinitAppConfig {
         size: startup.window_size,
         placement,
         ui_backend: startup.ui_backend.clone(),
-    }
-}
-
-#[inline]
-fn ui_build_from_startup(startup: &StartupConfig) -> Option<Box<dyn UiBuildFn>> {
-    match startup.ui_backend {
-        newengine_core::startup::UiBackend::Disabled => None,
-        _ => Some(Box::new(ui::EditorUiBuild::default())),
     }
 }
 
@@ -118,10 +115,47 @@ fn main() -> EngineResult<()> {
 
     let engine = build_engine_from_startup(&startup)?;
     let winit_cfg = winit_config_from_startup(&startup);
-    let ui_build = ui_build_from_startup(&startup);
+
+    // UI builder создаём сразу, но документ загрузим после того как импортёры поднимутся.
+    let shared_doc: Arc<Mutex<Option<UiMarkupDoc>>> = Arc::new(Mutex::new(None));
+    let ui_build: Option<Box<dyn UiBuildFn>> = match startup.ui_backend {
+        newengine_core::startup::UiBackend::Disabled => None,
+        _ => Some(Box::new(ui::EditorUiBuild::new(shared_doc.clone()))),
+    };
 
     run_winit_app_with_config(engine, winit_cfg, ui_build, move |engine| {
-        register_render_from_startup(engine, &startup)
+        // 1) Зарегистрировать рендер-модуль (не стартовать!)
+        register_render_from_startup(engine, &startup)?;
+
+        // 2) Поднять плагины/импортёры, но без старта модулей/рендера
+        engine.load_plugins_once()?;
+
+        // 3) Теперь импортёр .xml точно зарегистрирован -> грузим markup через AssetManager
+        if !matches!(startup.ui_backend, newengine_core::startup::UiBackend::Disabled) {
+            let am = engine
+                .resources
+                .get::<newengine_core::assets::AssetManager>()
+                .ok_or_else(|| EngineError::other("AssetManager missing in engine.resources"))?;
+
+            let store = am.store();
+            let mut pump = || {
+                am.pump();
+            };
+
+            let doc = UiMarkupDoc::load_from_store(
+                store,
+                &mut pump,
+                UI_MARKUP_PATH,
+                std::time::Duration::from_millis(250),
+            )
+                .map_err(|e| EngineError::other(format!("ui: load failed: {e}")))?;
+
+            if let Ok(mut g) = shared_doc.lock() {
+                *g = Some(doc);
+            }
+        }
+
+        Ok(())
     })?;
 
     println!("engine stopped");

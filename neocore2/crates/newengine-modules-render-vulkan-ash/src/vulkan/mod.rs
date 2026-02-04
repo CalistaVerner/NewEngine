@@ -1,10 +1,10 @@
 mod device;
 mod instance;
 mod pipeline;
-pub mod renderer;
 mod swapchain;
 mod text;
 mod ui;
 mod util;
+pub mod renderer;
 
 pub use renderer::VulkanRenderer;

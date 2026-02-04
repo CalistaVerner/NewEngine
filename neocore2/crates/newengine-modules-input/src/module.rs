@@ -320,6 +320,34 @@ impl ServiceV1 for InputService {
     "text_take_json":{"in":"{}","out":"{text:string} and clears internal text buffer"},
     "ime_commit_take_json":{"in":"{}","out":"{ime_commit:string} and clears internal commit buffer"}
   },
+  "console":{
+    "commands":[
+      {
+        "name":"input.state",
+        "help":"Print input snapshot JSON",
+        "kind":"service_call",
+        "service_id":"kalitech.input.v1",
+        "method":"state_json",
+        "payload":"empty"
+      },
+      {
+        "name":"input.text_take",
+        "help":"Take text buffer JSON (clears buffer)",
+        "kind":"service_call",
+        "service_id":"kalitech.input.v1",
+        "method":"text_take_json",
+        "payload":"empty"
+      },
+      {
+        "name":"input.ime_take",
+        "help":"Take IME commit JSON (clears buffer)",
+        "kind":"service_call",
+        "service_id":"kalitech.input.v1",
+        "method":"ime_commit_take_json",
+        "payload":"empty"
+      }
+    ]
+  },
   "events_expected":{
     "winit.key":"{key:u32, scancode?:u32, state:'pressed'|'released', repeat?:bool}",
     "winit.mouse_move":"{x:f32,y:f32}",
@@ -333,6 +361,7 @@ impl ServiceV1 for InputService {
 }"#,
         )
     }
+
 
     fn call(&self, method: MethodName, _payload: Blob) -> RResult<Blob, RString> {
         match method.as_str() {

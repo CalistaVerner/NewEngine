@@ -1,5 +1,12 @@
+use crate::ambience::AmbienceSystemV1Dyn;
 use crate::capability::{AudioCapabilityMask, AUDIO_API_VERSION_V1};
-use crate::occlusion::AudioOcclusionV1;
+use crate::environment::AudioEnvironmentV1Dyn;
+use crate::mixer::MixerSystemV1Dyn;
+use crate::music::MusicSystemV1Dyn;
+use crate::occlusion::AudioOcclusionV1Dyn;
+use crate::system::AudioSystemV1Dyn;
+use crate::vehicle::VehicleAudioV1Dyn;
+use crate::voice::VoiceSystemV1Dyn;
 
 #[cfg(feature = "abi")]
 use abi_stable::sabi_trait;
