@@ -24,19 +24,16 @@ pub fn init_host_context(asset_store: Arc<AssetStore>) {
 }
 
 #[inline]
-pub(crate) fn ctx() -> Arc<HostContext> {
-    HOST_CTX
-        .get()
-        .expect("HostContext not initialized (call init_host_context first)")
-        .clone()
+pub fn ctx() -> Arc<HostContext> {
+    HOST_CTX.get().expect("HostContext not initialized").clone()
 }
 
 #[inline]
-pub(crate) fn services_generation() -> u64 {
+pub fn services_generation() -> u64 {
     ctx().services_generation.load(Ordering::Acquire)
 }
 
 #[inline]
-pub(crate) fn bump_services_generation() {
+pub fn bump_services_generation() {
     ctx().services_generation.fetch_add(1, Ordering::AcqRel);
 }

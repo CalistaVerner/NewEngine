@@ -10,7 +10,7 @@ use crate::AssetManagerConfig;
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::{fmt};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -75,7 +75,10 @@ impl Elapsed {
     fn from_duration(d: Duration) -> Self {
         let us = d.as_micros();
         if us < 1000 {
-            Self { value: us, unit: "us" }
+            Self {
+                value: us,
+                unit: "us",
+            }
         } else {
             Self {
                 value: d.as_millis(),
@@ -201,7 +204,9 @@ impl<E: Send + 'static> Engine<E> {
 
         let id = module.id();
         if self.module_ids.contains(id) {
-            return Err(EngineError::Other(format!("module already registered: {id}")));
+            return Err(EngineError::Other(format!(
+                "module already registered: {id}"
+            )));
         }
 
         self.modules.push(module);
@@ -223,7 +228,12 @@ impl<E: Send + 'static> Engine<E> {
     }
 
     #[inline]
-    fn log_phase_ok(scope: &'static str, phase: &'static str, count: Option<usize>, elapsed: Elapsed) {
+    fn log_phase_ok(
+        scope: &'static str,
+        phase: &'static str,
+        count: Option<usize>,
+        elapsed: Elapsed,
+    ) {
         match count {
             Some(n) => log::info!("{scope}: done (phase={phase} count={n} {elapsed})"),
             None => log::info!("{scope}: done (phase={phase} {elapsed})"),
@@ -248,7 +258,10 @@ impl<E: Send + 'static> Engine<E> {
         // 1) Importers: only from `<exe_dir>/importers` (AssetManager ensures the directory exists).
         if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
             let host = importers_host_api();
-            if let Err(e) = self.plugins.load_importers_from_dir(am.importers_dir(), host) {
+            if let Err(e) = self
+                .plugins
+                .load_importers_from_dir(am.importers_dir(), host)
+            {
                 log::warn!(
                     target: "assets",
                     "importers: non-fatal load error (phase={} {}): {}",
@@ -461,7 +474,10 @@ impl<E: Send + 'static> Engine<E> {
         }
 
         #[inline]
-        fn shutdown_modules<E: Send + 'static>(engine: &mut Engine<E>, modules: &mut [Box<dyn Module<E>>]) {
+        fn shutdown_modules<E: Send + 'static>(
+            engine: &mut Engine<E>,
+            modules: &mut [Box<dyn Module<E>>],
+        ) {
             for m in modules.iter_mut().rev() {
                 let mut ctx = ModuleCtx::new(
                     engine.services.as_ref(),
@@ -495,7 +511,11 @@ impl<E: Send + 'static> Engine<E> {
 
             if let Err(err) = init_result {
                 shutdown_modules(self, &mut sorted[..initialized]);
-                return Err(EngineError::with_module_stage(sorted[i].id(), ModuleStage::Init, err));
+                return Err(EngineError::with_module_stage(
+                    sorted[i].id(),
+                    ModuleStage::Init,
+                    err,
+                ));
             }
 
             initialized = initialized.saturating_add(1);
@@ -505,9 +525,6 @@ impl<E: Send + 'static> Engine<E> {
                 shutdown_modules(self, &mut sorted[..initialized]);
                 self.modules = sorted;
                 self.module_ids = self.modules.iter().map(|mm| mm.id()).collect();
-                if crate::console::take_exit_requested() {
-                    self.exit_requested = true;
-                }
                 return Err(EngineError::ExitRequested);
             }
         }
@@ -530,7 +547,11 @@ impl<E: Send + 'static> Engine<E> {
 
             if let Err(err) = start_result {
                 shutdown_modules(self, &mut sorted[..initialized]);
-                return Err(EngineError::with_module_stage(sorted[i].id(), ModuleStage::Start, err));
+                return Err(EngineError::with_module_stage(
+                    sorted[i].id(),
+                    ModuleStage::Start,
+                    err,
+                ));
             }
 
             self.propagate_shutdown_request();
@@ -580,7 +601,12 @@ impl<E: Send + 'static> Engine<E> {
             );
         }
 
-        Self::log_phase_ok("plugins", phase, Some(list.len()), Self::elapsed_since(t_reg0));
+        Self::log_phase_ok(
+            "plugins",
+            phase,
+            Some(list.len()),
+            Self::elapsed_since(t_reg0),
+        );
 
         // Start plugins
         let phase = "start_all";
@@ -591,7 +617,12 @@ impl<E: Send + 'static> Engine<E> {
             return Err(Self::phase_err(phase, Self::elapsed_since(t_start0), e));
         }
 
-        Self::log_phase_ok("plugins", phase, Some(list.len()), Self::elapsed_since(t_start0));
+        Self::log_phase_ok(
+            "plugins",
+            phase,
+            Some(list.len()),
+            Self::elapsed_since(t_start0),
+        );
 
         // Rich diagnostics after logger is installed and plugins are started.
         // This keeps logs stable even if plugins/importers were loaded before Engine::start().
@@ -651,10 +682,14 @@ impl<E: Send + 'static> Engine<E> {
             };
 
             if let Err(e) = self.plugins.fixed_update_all(self.fixed_dt) {
-                return Err(EngineError::Other(format!("plugins: fixed_update failed: {e}")));
+                return Err(EngineError::Other(format!(
+                    "plugins: fixed_update failed: {e}"
+                )));
             }
 
-            self.run_stage(&fixed_frame, ModuleStage::FixedUpdate, |m, ctx| m.fixed_update(ctx))?;
+            self.run_stage(&fixed_frame, ModuleStage::FixedUpdate, |m, ctx| {
+                m.fixed_update(ctx)
+            })?;
         }
 
         let frame = Frame {
@@ -683,11 +718,16 @@ impl<E: Send + 'static> Engine<E> {
         if let Some(am) = self.resources.get::<crate::assets::AssetManager>() {
             am.pump();
         }
+        if crate::console::take_exit_requested() {
+            self.exit_requested = true;
+        }
 
         Ok(frame)
     }
 
-    #[deprecated(note = "Use Engine::emit(...) + EventHub subscriptions instead of synchronous fan-out")]
+    #[deprecated(
+        note = "Use Engine::emit(...) + EventHub subscriptions instead of synchronous fan-out"
+    )]
     pub fn dispatch_external_event(&mut self, event: &dyn Any) -> EngineResult<()> {
         self.sync_shutdown_state();
         if self.is_exit_requested() {
@@ -713,7 +753,8 @@ impl<E: Send + 'static> Engine<E> {
             }
 
             let module_id = m.id();
-            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
+            let mut ctx =
+                ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
 
             #[allow(deprecated)]
             m.on_external_event(&mut ctx, event).map_err(|e| {
@@ -784,7 +825,8 @@ impl<E: Send + 'static> Engine<E> {
 
             let module_id = m.id();
 
-            let mut ctx = ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
+            let mut ctx =
+                ModuleCtx::new(services, resources, bus, events, scheduler, exit_requested);
             ctx.set_frame(frame);
 
             call(m.as_mut(), &mut ctx)
