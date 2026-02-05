@@ -13,7 +13,7 @@ struct CommandExecResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Default)]
 struct SuggestItem {
     #[serde(default)]
     kind: String,
@@ -27,7 +27,7 @@ struct SuggestItem {
     usage: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Default)]
 struct SuggestResponse {
     #[serde(default)]
     signature: String,
@@ -307,6 +307,16 @@ impl ConsoleUi {
     }
 
     fn suggest_panel(&mut self, ui: &mut egui::Ui) {
+        if self.suggest.items.is_empty() {
+            self.suggest_open = false;
+            self.suggest_selected = 0;
+            return;
+        }
+
+        self.suggest_selected = self
+            .suggest_selected
+            .min(self.suggest.items.len().saturating_sub(1));
+
         let bg = egui::Color32::from_rgba_premultiplied(16, 16, 18, 245);
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(55));
 
@@ -330,17 +340,18 @@ impl ConsoleUi {
                     let left = &mut left[0];
                     let right = &mut right[0];
 
-                    let list_h: f32 = 140.0;
+                    const SUGGEST_LIST_HEIGHT: f32 = 140.0;
 
                     let mut click_select: Option<usize> = None;
                     let mut accept_insert: Option<String> = None;
                     let mut accept_refresh = false;
 
                     egui::ScrollArea::vertical()
-                        .max_height(list_h)
+                        .max_height(SUGGEST_LIST_HEIGHT)
                         .show(left, |ui| {
                             for (i, it) in self.suggest.items.iter().enumerate() {
                                 let selected = i == self.suggest_selected;
+
                                 let text = if it.help.is_empty() {
                                     it.display.clone()
                                 } else {
@@ -379,14 +390,21 @@ impl ConsoleUi {
                         }
                     }
 
+                    // ВАЖНО: snapshot выбранного элемента после возможных изменений
+                    if self.suggest.items.is_empty() {
+                        self.suggest_open = false;
+                        self.suggest_selected = 0;
+                        return;
+                    }
 
-                    let idx = self
+                    self.suggest_selected = self
                         .suggest_selected
                         .min(self.suggest.items.len().saturating_sub(1));
-                    let it = &self.suggest.items[idx];
+
+                    let it = self.suggest.items[self.suggest_selected].clone();
 
                     right.label(
-                        egui::RichText::new(it.usage.clone())
+                        egui::RichText::new(it.usage)
                             .monospace()
                             .strong()
                             .color(egui::Color32::from_gray(230)),
@@ -395,7 +413,7 @@ impl ConsoleUi {
 
                     if !it.help.is_empty() {
                         right.label(
-                            egui::RichText::new(it.help.clone())
+                            egui::RichText::new(it.help)
                                 .monospace()
                                 .color(egui::Color32::from_gray(190)),
                         );

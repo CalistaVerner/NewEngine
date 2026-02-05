@@ -75,6 +75,7 @@ struct SuggestResponse {
     items: Vec<SuggestItem>,
 }
 
+
 pub struct ConsoleRuntime {
     cmds: BTreeMap<&'static str, Cmd>,
     dyn_cmds: std::sync::Mutex<BTreeMap<String, DynCommand>>,
