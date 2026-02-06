@@ -3,9 +3,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
-/// CPU-side camera matrices.
-///
-/// Uses `glam` types for ergonomics and math. Not POD.
+/// CPU-side camera matrices (ergonomic).
 #[derive(Clone, Copy, Debug)]
 pub struct CameraMatrices {
     pub view: Mat4,
@@ -60,16 +58,20 @@ impl CameraMatrices {
         }
     }
 
-    /// Convert into a strict POD layout suitable for GPU uploads.
+    /// Strict POD layout for GPU uploads (full matrices).
     #[inline]
     pub fn to_gpu(&self) -> GpuCameraMatrices {
         GpuCameraMatrices::from_cpu(*self)
     }
+
+    /// Compact POD layout for world shading (recommended default).
+    #[inline]
+    pub fn to_uniform(&self) -> CameraUniform {
+        CameraUniform::from_cpu(*self)
+    }
 }
 
-/// GPU-friendly camera constants.
-///
-/// Column-major matrices (GLSL convention), `std140`-friendly padding.
+/// GPU-friendly full camera constants (rarely needed every pass).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuCameraMatrices {
@@ -108,9 +110,46 @@ impl GpuCameraMatrices {
     }
 }
 
+/// Compact GPU uniform for the world pass.
+/// This is the baseline for rendering worlds at scale.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct CameraUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub world_pos: [f32; 3],
+    pub near_plane: f32,
+    pub viewport: [f32; 4], // (w, h, 1/w, 1/h)
+    pub jitter: [f32; 2],
+    pub far_plane: f32,
+    pub _pad0: f32,
+}
+
+impl CameraUniform {
+    #[inline]
+    pub fn from_cpu(c: CameraMatrices) -> Self {
+        // Near/Far will be filled by CameraState (projection knows it).
+        // Here keep zeros; caller can patch near/far if needed.
+        Self {
+            view_proj: mat4_to_cols(c.view_proj),
+            world_pos: [c.world_pos.x, c.world_pos.y, c.world_pos.z],
+            near_plane: 0.0,
+            viewport: [c.viewport.x, c.viewport.y, c.viewport.z, c.viewport.w],
+            jitter: [c.jitter.x, c.jitter.y],
+            far_plane: 0.0,
+            _pad0: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn with_near_far(mut self, near_plane: f32, far_plane: f32) -> Self {
+        self.near_plane = near_plane;
+        self.far_plane = far_plane;
+        self
+    }
+}
+
 #[inline]
 fn mat4_to_cols(m: Mat4) -> [[f32; 4]; 4] {
-    // glam Mat4 is column-major: x_axis/y_axis/z_axis/w_axis are columns (Vec4).
     [
         [m.x_axis.x, m.x_axis.y, m.x_axis.z, m.x_axis.w],
         [m.y_axis.x, m.y_axis.y, m.y_axis.z, m.y_axis.w],
