@@ -126,12 +126,18 @@ pub(crate) extern "C" fn call_service_v1(
     svc.call(method, payload)
 }
 
-extern "C" fn host_emit_event_v1(_topic: RString, _payload: Blob) -> RResult<(), RString> {
-    RResult::ROk(())
+extern "C" fn host_emit_event_v1(topic: RString, payload: Blob) -> RResult<(), RString> {
+    match crate::plugins::host_context::emit_plugin_event(topic, payload) {
+        Ok(()) => RResult::ROk(()),
+        Err(e) => RResult::RErr(RString::from(e)),
+    }
 }
 
-extern "C" fn host_subscribe_events_v1(_sink: EventSinkV1Dyn<'static>) -> RResult<(), RString> {
-    RResult::ROk(())
+extern "C" fn host_subscribe_events_v1(sink: EventSinkV1Dyn<'static>) -> RResult<(), RString> {
+    match crate::plugins::host_context::subscribe_event_sink(sink) {
+        Ok(()) => RResult::ROk(()),
+        Err(e) => RResult::RErr(RString::from(e)),
+    }
 }
 
 pub fn default_host_api() -> HostApiV1 {

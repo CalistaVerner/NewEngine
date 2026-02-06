@@ -1,35 +1,33 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use newengine_core::host_events::{
-    HostEvent, InputHostEvent, KeyCode, KeyState, MouseButton, TextHostEvent, WindowHostEvent,
-};
+use std::time::Instant;
+
+use abi_stable::std_types::{RString, RVec};
+use newengine_core::host_events::{HostEvent, WindowHostEvent};
 use newengine_core::startup::UiBackend;
 use newengine_core::{Engine, EngineError, EngineResult};
+use newengine_plugin_api::Blob;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::{
     application::ApplicationHandler,
-    dpi::PhysicalPosition,
-    dpi::PhysicalSize,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode as WKeyCode, PhysicalKey},
+    keyboard::PhysicalKey,
     window::{Window, WindowAttributes, WindowId},
 };
 
 use newengine_ui::draw::UiDrawList;
-use newengine_ui::{create_provider, UiBuildFn, UiFrameDesc, UiProvider, UiProviderKind, UiProviderOptions};
-
-use std::time::Instant;
+use newengine_ui::{
+    create_provider, UiBuildFn, UiFrameDesc, UiInputFrame, UiProvider, UiProviderKind,
+    UiProviderOptions,
+};
 
 /// Window placement policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WinitWindowPlacement {
-    /// Let the OS decide.
     OsDefault,
-    /// Place the window in the center of the primary monitor.
-    /// `offset` allows fine-tuning (e.g. move slightly up).
     Centered { offset: (i32, i32) },
-    /// Place the window at an absolute physical position on screen.
     Absolute { x: i32, y: i32 },
 }
 
@@ -39,9 +37,6 @@ pub struct WinitAppConfig {
     pub title: String,
     pub size: (u32, u32),
     pub placement: WinitWindowPlacement,
-
-    /// UI backend selection (boot-time).
-    /// Default is `UiBackend::Egui` so UI works without any args.
     pub ui_backend: UiBackend,
 }
 
@@ -57,15 +52,14 @@ impl Default for WinitAppConfig {
     }
 }
 
-/// Engine-thread local window handles (not Send/Sync on some platforms).
+/// Engine-thread local window handles.
 #[derive(Debug, Clone, Copy)]
 pub struct WinitWindowHandles {
     pub window: RawWindowHandle,
     pub display: RawDisplayHandle,
 }
 
-/// Initial window size snapshot taken right after window creation.
-/// Vulkan swapchain bootstrap needs it without storing `winit::Window`.
+/// Initial window size snapshot.
 #[derive(Debug, Clone, Copy)]
 pub struct WinitWindowInitSize {
     pub width: u32,
@@ -141,7 +135,10 @@ where
     }
 
     #[inline]
-    fn build_window_attributes(event_loop: &ActiveEventLoop, config: &WinitAppConfig) -> WindowAttributes {
+    fn build_window_attributes(
+        event_loop: &ActiveEventLoop,
+        config: &WinitAppConfig,
+    ) -> WindowAttributes {
         let (width, height) = config.size;
         let mut attrs = WindowAttributes::default()
             .with_title(config.title.clone())
@@ -164,7 +161,8 @@ where
                 let mp = monitor.position();
 
                 let cx = mp.x.saturating_add(((ms.width as i32).saturating_sub(width as i32)) / 2);
-                let cy = mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
+                let cy =
+                    mp.y.saturating_add(((ms.height as i32).saturating_sub(height as i32)) / 2);
 
                 attrs = attrs.with_position(PhysicalPosition::new(
                     cx.saturating_add(ox),
@@ -243,108 +241,57 @@ where
 
     #[inline]
     fn emit_focused(&mut self, focused: bool) {
-        let _ = self
-            .engine
-            .emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
-    }
-
-    #[inline]
-    fn map_key_code(code: WKeyCode) -> KeyCode {
-        match code {
-            WKeyCode::Escape => KeyCode::Escape,
-            WKeyCode::Enter => KeyCode::Enter,
-            WKeyCode::Space => KeyCode::Space,
-            WKeyCode::Tab => KeyCode::Tab,
-            WKeyCode::Backspace => KeyCode::Backspace,
-
-            WKeyCode::ArrowUp => KeyCode::ArrowUp,
-            WKeyCode::ArrowDown => KeyCode::ArrowDown,
-            WKeyCode::ArrowLeft => KeyCode::ArrowLeft,
-            WKeyCode::ArrowRight => KeyCode::ArrowRight,
-
-            WKeyCode::KeyA => KeyCode::A,
-            WKeyCode::KeyB => KeyCode::B,
-            WKeyCode::KeyC => KeyCode::C,
-            WKeyCode::KeyD => KeyCode::D,
-            WKeyCode::KeyE => KeyCode::E,
-            WKeyCode::KeyF => KeyCode::F,
-            WKeyCode::KeyG => KeyCode::G,
-            WKeyCode::KeyH => KeyCode::H,
-            WKeyCode::KeyI => KeyCode::I,
-            WKeyCode::KeyJ => KeyCode::J,
-            WKeyCode::KeyK => KeyCode::K,
-            WKeyCode::KeyL => KeyCode::L,
-            WKeyCode::KeyM => KeyCode::M,
-            WKeyCode::KeyN => KeyCode::N,
-            WKeyCode::KeyO => KeyCode::O,
-            WKeyCode::KeyP => KeyCode::P,
-            WKeyCode::KeyQ => KeyCode::Q,
-            WKeyCode::KeyR => KeyCode::R,
-            WKeyCode::KeyS => KeyCode::S,
-            WKeyCode::KeyT => KeyCode::T,
-            WKeyCode::KeyU => KeyCode::U,
-            WKeyCode::KeyV => KeyCode::V,
-            WKeyCode::KeyW => KeyCode::W,
-            WKeyCode::KeyX => KeyCode::X,
-            WKeyCode::KeyY => KeyCode::Y,
-            WKeyCode::KeyZ => KeyCode::Z,
-
-            WKeyCode::Digit0 => KeyCode::Digit0,
-            WKeyCode::Digit1 => KeyCode::Digit1,
-            WKeyCode::Digit2 => KeyCode::Digit2,
-            WKeyCode::Digit3 => KeyCode::Digit3,
-            WKeyCode::Digit4 => KeyCode::Digit4,
-            WKeyCode::Digit5 => KeyCode::Digit5,
-            WKeyCode::Digit6 => KeyCode::Digit6,
-            WKeyCode::Digit7 => KeyCode::Digit7,
-            WKeyCode::Digit8 => KeyCode::Digit8,
-            WKeyCode::Digit9 => KeyCode::Digit9,
-
-            WKeyCode::F1 => KeyCode::F1,
-            WKeyCode::F2 => KeyCode::F2,
-            WKeyCode::F3 => KeyCode::F3,
-            WKeyCode::F4 => KeyCode::F4,
-            WKeyCode::F5 => KeyCode::F5,
-            WKeyCode::F6 => KeyCode::F6,
-            WKeyCode::F7 => KeyCode::F7,
-            WKeyCode::F8 => KeyCode::F8,
-            WKeyCode::F9 => KeyCode::F9,
-            WKeyCode::F10 => KeyCode::F10,
-            WKeyCode::F11 => KeyCode::F11,
-            WKeyCode::F12 => KeyCode::F12,
-
-            _ => KeyCode::Unknown,
-        }
-    }
-
-    #[inline]
-    fn map_mouse_button(btn: winit::event::MouseButton) -> MouseButton {
-        match btn {
-            winit::event::MouseButton::Left => MouseButton::Left,
-            winit::event::MouseButton::Right => MouseButton::Right,
-            winit::event::MouseButton::Middle => MouseButton::Middle,
-            winit::event::MouseButton::Back => MouseButton::Other(4),
-            winit::event::MouseButton::Forward => MouseButton::Other(5),
-            winit::event::MouseButton::Other(v) => MouseButton::Other(v),
-        }
-    }
-
-    #[inline]
-    fn map_state(s: ElementState) -> KeyState {
-        match s {
-            ElementState::Pressed => KeyState::Pressed,
-            ElementState::Released => KeyState::Released,
-        }
+        let _ = self.engine.emit(HostEvent::Window(WindowHostEvent::Focused(focused)));
     }
 
     #[inline]
     fn frame_dt_seconds(&mut self) -> f32 {
         let now = Instant::now();
-        let dt = match self.last_frame_instant.replace(now) {
+        match self.last_frame_instant.replace(now) {
             Some(prev) => now.duration_since(prev).as_secs_f32(),
             None => 0.0,
+        }
+    }
+
+    #[inline]
+    fn emit_plugin_json(topic: &'static str, value: serde_json::Value) {
+        let bytes = match serde_json::to_vec(&value) {
+            Ok(b) => b,
+            Err(_) => return,
         };
-        dt
+
+        let _ = newengine_core::plugins::host_context::emit_plugin_event(
+            RString::from(topic),
+            Blob::from(bytes),
+        );
+    }
+
+    #[inline]
+    fn map_mouse_button_u32(btn: winit::event::MouseButton) -> u32 {
+        match btn {
+            winit::event::MouseButton::Left => 1,
+            winit::event::MouseButton::Right => 2,
+            winit::event::MouseButton::Middle => 3,
+            winit::event::MouseButton::Back => 4,
+            winit::event::MouseButton::Forward => 5,
+            winit::event::MouseButton::Other(v) => v as u32,
+        }
+    }
+
+    #[inline]
+    fn map_state_str(s: ElementState) -> &'static str {
+        match s {
+            ElementState::Pressed => "pressed",
+            ElementState::Released => "released",
+        }
+    }
+
+    #[inline]
+    fn key_u32_from_physical_key(k: &PhysicalKey) -> u32 {
+        match k {
+            PhysicalKey::Code(c) => *c as u32,
+            PhysicalKey::Unidentified(_) => 0,
+        }
     }
 
     fn set_fatal_and_exit(&mut self, event_loop: &ActiveEventLoop, e: EngineError) {
@@ -372,6 +319,103 @@ where
         }
 
         event_loop.exit();
+    }
+
+    fn call_service_utf8(&self, service_id: &str, method: &str) -> Option<String> {
+        let c = newengine_core::plugins::host_context::ctx();
+        let g = c.services.lock().ok()?;
+        let svc = g.get(service_id)?.clone();
+        drop(g);
+
+        let res = svc.call(RString::from(method), Blob::from(Vec::new()));
+        let blob = res.into_result().ok()?;
+        let bytes: Vec<u8> = blob.into_vec();
+        Some(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn poll_input_frame(&self) -> Option<UiInputFrame> {
+        // Canonical input service
+        const SID: &str = "kalitech.input.v1";
+
+        let state_json = self.call_service_utf8(SID, "state_json")?;
+        let text_json = self.call_service_utf8(SID, "text_take_json").unwrap_or_else(|| "{}".into());
+        let ime_json = self
+            .call_service_utf8(SID, "ime_commit_take_json")
+            .unwrap_or_else(|| "{}".into());
+
+        let mut out = UiInputFrame::default();
+
+        let st: serde_json::Value = serde_json::from_str(&state_json).ok()?;
+
+        // keys
+        if let Some(keys) = st.get("keys") {
+            for (field, target) in [
+                ("down", &mut out.keys_down),
+                ("pressed", &mut out.keys_pressed),
+                ("released", &mut out.keys_released),
+            ] {
+                if let Some(arr) = keys.get(field).and_then(|v| v.as_array()) {
+                    for x in arr {
+                        if let Some(u) = x.as_u64() {
+                            target.insert(u as u32);
+                        }
+                    }
+                }
+            }
+        }
+
+        // mouse
+        if let Some(mouse) = st.get("mouse") {
+            if let Some(pos) = mouse.get("pos") {
+                let x = pos.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let y = pos.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                out.mouse_pos = Some((x, y));
+            }
+            if let Some(delta) = mouse.get("delta") {
+                out.mouse_delta.0 = delta.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                out.mouse_delta.1 = delta.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            }
+            if let Some(wheel) = mouse.get("wheel") {
+                out.mouse_wheel.0 = wheel.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                out.mouse_wheel.1 = wheel.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            }
+
+            for (field, target) in [
+                ("down", &mut out.mouse_down),
+                ("pressed", &mut out.mouse_pressed),
+                ("released", &mut out.mouse_released),
+            ] {
+                if let Some(arr) = mouse.get(field).and_then(|v| v.as_array()) {
+                    for x in arr {
+                        if let Some(u) = x.as_u64() {
+                            target.insert(u as u32);
+                        }
+                    }
+                }
+            }
+        }
+
+        // text buffers
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text_json) {
+            if let Some(s) = v.get("text").and_then(|x| x.as_str()) {
+                out.text.push_str(s);
+            }
+        }
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ime_json) {
+            if let Some(s) = v.get("ime_commit").and_then(|x| x.as_str()) {
+                out.ime_commit.push_str(s);
+            }
+        }
+
+        // optional from snapshot:
+        if let Some(text) = st.get("text") {
+            if let Some(s) = text.get("ime_preedit").and_then(|x| x.as_str()) {
+                out.ime_preedit.push_str(s);
+            }
+        }
+
+        Some(out)
     }
 }
 
@@ -416,9 +460,8 @@ where
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let Some(w) = self.window.as_ref() {
-            self.ui.on_platform_event(w, &event);
-        }
+        // IMPORTANT: No UI backend is allowed to consume platform input directly.
+        // All input must flow through the INPUT plugin.
 
         match event {
             WindowEvent::CloseRequested => {
@@ -440,40 +483,45 @@ where
                 self.emit_focused(focused);
             }
 
+            // forward-only to input plugin
             WindowEvent::KeyboardInput { event, .. } => {
-                let state = Self::map_state(event.state);
+                let key = Self::key_u32_from_physical_key(&event.physical_key);
+                let state = Self::map_state_str(event.state);
                 let repeat = event.repeat;
 
-                let code = match event.physical_key {
-                    PhysicalKey::Code(c) => Self::map_key_code(c),
-                    PhysicalKey::Unidentified(_) => KeyCode::Unknown,
-                };
-
-                let _ = self.engine.emit(HostEvent::Input(InputHostEvent::Key {
-                    code,
-                    state,
-                    repeat,
-                }));
-
-                if code == KeyCode::Escape && state == KeyState::Pressed {
-                    self.shutdown_and_exit(event_loop);
-                    return;
-                }
+                Self::emit_plugin_json(
+                    "winit.key",
+                    serde_json::json!({
+                        "key": key,
+                        "scancode": 0u32,
+                        "state": state,
+                        "repeat": repeat
+                    }),
+                );
 
                 if let Some(text) = event.text.as_ref() {
                     for ch in text.chars() {
-                        let _ = self.engine.emit(HostEvent::Text(TextHostEvent::Char(ch)));
+                        Self::emit_plugin_json(
+                            "winit.text_char",
+                            serde_json::json!({
+                                "cp": ch as u32
+                            }),
+                        );
                     }
                 }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseButton {
-                        button: Self::map_mouse_button(button),
-                        state: Self::map_state(state),
-                    }));
+                let b = Self::map_mouse_button_u32(button);
+                let st = Self::map_state_str(state);
+
+                Self::emit_plugin_json(
+                    "winit.mouse_button",
+                    serde_json::json!({
+                        "button": b,
+                        "state": st
+                    }),
+                );
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -481,9 +529,14 @@ where
                     MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseWheel { dx, dy }));
+
+                Self::emit_plugin_json(
+                    "winit.mouse_wheel",
+                    serde_json::json!({
+                        "dx": dx,
+                        "dy": dy
+                    }),
+                );
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -491,31 +544,42 @@ where
                 let y = position.y as f32;
 
                 if let Some((px, py)) = self.last_cursor_pos {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Input(InputHostEvent::MouseDelta {
-                            dx: x - px,
-                            dy: y - py,
-                        }));
+                    Self::emit_plugin_json(
+                        "winit.mouse_delta",
+                        serde_json::json!({
+                            "dx": x - px,
+                            "dy": y - py
+                        }),
+                    );
                 }
 
                 self.last_cursor_pos = Some((x, y));
 
-                let _ = self
-                    .engine
-                    .emit(HostEvent::Input(InputHostEvent::MouseMove { x, y }));
+                Self::emit_plugin_json(
+                    "winit.mouse_move",
+                    serde_json::json!({
+                        "x": x,
+                        "y": y
+                    }),
+                );
             }
 
             WindowEvent::Ime(ime) => match ime {
                 Ime::Commit(text) => {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Text(TextHostEvent::ImeCommit(text)));
+                    Self::emit_plugin_json(
+                        "winit.ime_commit",
+                        serde_json::json!({
+                            "text": text
+                        }),
+                    );
                 }
                 Ime::Preedit(text, _) => {
-                    let _ = self
-                        .engine
-                        .emit(HostEvent::Text(TextHostEvent::ImePreedit(text)));
+                    Self::emit_plugin_json(
+                        "winit.ime_preedit",
+                        serde_json::json!({
+                            "text": text
+                        }),
+                    );
                 }
                 Ime::Enabled | Ime::Disabled => {}
             },
@@ -544,8 +608,15 @@ where
 
         let dt = self.frame_dt_seconds();
 
+        let input = self.poll_input_frame();
+
         if let (Some(w), Some(build)) = (self.window.as_ref(), self.ui_build.as_deref_mut()) {
-            let out = self.ui.run_frame(w, UiFrameDesc::new(dt), build);
+            let mut desc = UiFrameDesc::new(dt);
+            if let Some(inp) = input {
+                desc = desc.with_input(inp);
+            }
+
+            let out = self.ui.run_frame(w, desc, build);
             self.engine.resources_mut().insert::<UiDrawList>(out.draw_list);
         }
 

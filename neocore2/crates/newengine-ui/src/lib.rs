@@ -3,11 +3,13 @@
 pub mod draw;
 pub mod texture;
 
+pub mod input;
 pub mod provider;
 pub mod providers;
 
 pub mod markup;
 
+pub use input::UiInputFrame;
 pub use provider::{
     UiBuildFn, UiFrameDesc, UiFrameOutput, UiProvider, UiProviderKind, UiProviderOptions,
 };

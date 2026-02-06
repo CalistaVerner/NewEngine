@@ -2,7 +2,7 @@
 
 mod describe;
 pub(crate) mod host_api;
-pub(crate) mod host_context;
+pub mod host_context;
 mod importer;
 mod manager;
 mod paths;

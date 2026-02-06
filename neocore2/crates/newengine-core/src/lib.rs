@@ -5,7 +5,7 @@ pub mod events;
 pub mod frame;
 pub mod host_events;
 pub mod module;
-mod plugins;
+pub mod plugins;
 pub mod sched;
 pub mod sync;
 mod system_info;
@@ -14,7 +14,6 @@ pub mod startup;
 pub mod assets;
 pub mod assets_service;
 pub mod console;
-
 pub mod host_services;
 
 pub use host_services::{call_service_v1, describe_service, list_service_ids};
