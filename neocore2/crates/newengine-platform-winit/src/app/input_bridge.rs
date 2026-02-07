@@ -20,18 +20,23 @@ pub fn emit_plugin_json(topic: &'static str, value: serde_json::Value) {
 }
 
 /// Calls a service method returning UTF-8 payload (best-effort).
-pub fn call_service_utf8(engine: &Engine<impl Send + 'static>, service_id: &str, method: &str) -> Option<String> {
+pub fn call_service_utf8(
+    _engine: &Engine<impl Send + 'static>,
+    service_id: &str,
+    method: &str,
+) -> Option<String> {
     let c = newengine_core::plugins::host_context::ctx();
-    let g = c.services.lock().ok()?;
-    let svc = g.get(service_id)?.clone();
-    drop(g);
+
+    let svc = {
+        let g = c.services.lock().ok()?;
+        g.get(service_id)?.service.clone()
+    };
 
     let res = svc.call(RString::from(method), Blob::from(Vec::new()));
     let blob = res.into_result().ok()?;
     let bytes: Vec<u8> = blob.into_vec();
     Some(String::from_utf8_lossy(&bytes).to_string())
 }
-
 /// Polls input snapshot from the canonical INPUT plugin and maps it into UiInputFrame.
 ///
 /// IMPORTANT: No UI backend should consume platform input directly.

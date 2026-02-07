@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "input"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "abi_stable",
  "embed-resource",

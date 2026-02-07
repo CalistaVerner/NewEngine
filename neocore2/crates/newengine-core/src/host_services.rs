@@ -36,5 +36,5 @@ pub fn describe_service(service_id: &str) -> Option<String> {
     let c = host_context::ctx();
     let g = c.services.lock().ok()?;
     let svc = g.get(service_id)?.clone();
-    Some(svc.describe().to_string())
+    Some(svc.describe_json.to_string())
 }

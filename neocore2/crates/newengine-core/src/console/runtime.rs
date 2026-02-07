@@ -22,7 +22,6 @@ pub struct ConsoleRuntime {
     dyn_cmds: Mutex<BTreeMap<String, DynCommand>>,
     method_cache: Mutex<BTreeMap<String, Vec<String>>>,
 
-    // Generation of service registry snapshot used to build method_cache/dyn_cmds.
     cached_services_gen: AtomicU64,
 
     exit_requested: AtomicBool,
@@ -385,7 +384,6 @@ impl ConsoleRuntime {
     }
 
     fn ensure_method_cache(&self, service_id: &str) {
-        // If registry changed - rebuild everything once.
         self.refresh_if_services_changed();
 
         let has = match self.method_cache.lock() {
@@ -447,8 +445,8 @@ impl ConsoleRuntime {
             }
         };
 
-        for (id, svc) in services.iter() {
-            let describe = svc.describe().to_string();
+        for (id, entry) in services.iter() {
+            let describe = entry.describe_json.clone();
 
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&describe) else {
                 continue;
@@ -476,37 +474,37 @@ impl ConsoleRuntime {
             };
 
             for c in cmds {
-                let Ok(entry) = serde_json::from_value::<ConsoleCmdEntry>(c.clone()) else {
+                let Ok(entry_cmd) = serde_json::from_value::<ConsoleCmdEntry>(c.clone()) else {
                     continue;
                 };
 
-                let kind = entry.kind.as_deref().unwrap_or("service_call");
+                let kind = entry_cmd.kind.as_deref().unwrap_or("service_call");
                 if kind != "service_call" {
                     continue;
                 }
 
-                let sid = entry.service_id.clone().unwrap_or_else(|| id.clone());
-                let method = entry.method.clone().unwrap_or_default();
+                let sid = entry_cmd.service_id.clone().unwrap_or_else(|| id.clone());
+                let method = entry_cmd.method.clone().unwrap_or_default();
                 if method.is_empty() {
                     continue;
                 }
 
-                let payload = match entry.payload.as_deref() {
+                let payload = match entry_cmd.payload.as_deref() {
                     Some("empty") => DynPayload::Empty,
                     _ => DynPayload::Raw,
                 };
 
-                let usage = entry
+                let usage = entry_cmd
                     .usage
                     .clone()
-                    .unwrap_or_else(|| format!("{} <args>", entry.name));
-                let help = entry
+                    .unwrap_or_else(|| format!("{} <args>", entry_cmd.name));
+                let help = entry_cmd
                     .help
                     .clone()
                     .unwrap_or_else(|| format!("{sid}::{method}"));
 
                 out.insert(
-                    entry.name,
+                    entry_cmd.name,
                     DynCommand {
                         help,
                         usage,
@@ -537,11 +535,11 @@ impl ConsoleRuntime {
             .lock()
             .map_err(|_| "services mutex poisoned".to_string())?;
 
-        let svc = g
+        let entry = g
             .get(service_id)
             .ok_or_else(|| format!("unknown service: {service_id}"))?;
 
-        Ok(svc.describe().to_string())
+        Ok(entry.describe_json.clone())
     }
 
     fn describe_service(&self, line: &str) -> Result<String, String> {
@@ -575,25 +573,34 @@ impl ConsoleRuntime {
         self.call_service_raw(sid, method, payload.as_bytes())
     }
 
-    fn call_service_raw(&self, service_id: &str, method: &str, payload: &[u8]) -> Result<String, String> {
+    fn call_service_raw(
+        &self,
+        service_id: &str,
+        method: &str,
+        payload: &[u8],
+    ) -> Result<String, String> {
         let c = host_context::ctx();
         let g = c
             .services
             .lock()
             .map_err(|_| "services mutex poisoned".to_string())?;
 
-        let svc = g
+        let entry = g
             .get(service_id)
             .ok_or_else(|| format!("unknown service: {service_id}"))?;
 
-        let res = svc.call(abi_stable::std_types::RString::from(method), newengine_plugin_api::Blob::from(payload.to_vec()));
+        let res = entry.service.call(
+            abi_stable::std_types::RString::from(method),
+            newengine_plugin_api::Blob::from(payload.to_vec()),
+        );
 
         match res.into_result() {
             Ok(b) => {
                 let bytes = b.into_vec();
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    return Ok(serde_json::to_string_pretty(&v)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string()));
+                    return Ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| {
+                        String::from_utf8_lossy(&bytes).to_string()
+                    }));
                 }
                 Ok(String::from_utf8_lossy(&bytes).to_string())
             }

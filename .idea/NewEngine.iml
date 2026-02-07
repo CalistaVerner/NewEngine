@@ -20,6 +20,7 @@
       <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-ui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-import-png/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-camera/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/neocore2/crates/newengine-console/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/neocore2/target" />
     </content>
     <orderEntry type="inheritedJdk" />

@@ -266,8 +266,8 @@ impl ConsoleUi {
                     .id(input_id)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("Type a command (Tab for suggestions)")
-                    .lock_focus(true),
+                    .hint_text("Type a command (Tab for suggestions)"),
+                // .lock_focus(true)  // REMOVE: мешает нормальному вводу
             );
 
             let has_focus = resp.has_focus();
@@ -277,6 +277,23 @@ impl ConsoleUi {
             let up = self.key_pressed(KeyCode::ArrowUp as u32);
             let down = self.key_pressed(KeyCode::ArrowDown as u32);
             let esc = self.key_pressed(KeyCode::Escape as u32);
+
+            // IMPORTANT:
+            // We drive these keys via Input plugin logic; egui must not also handle them for TextEdit.
+            if has_focus {
+                ui.ctx().input_mut(|i| {
+                    i.events.retain(|e| {
+                        !matches!(
+                        e,
+                        egui::Event::Key { key: egui::Key::Tab, .. }
+                            | egui::Event::Key { key: egui::Key::Enter, .. }
+                            | egui::Event::Key { key: egui::Key::ArrowUp, .. }
+                            | egui::Event::Key { key: egui::Key::ArrowDown, .. }
+                            | egui::Event::Key { key: egui::Key::Escape, .. }
+                    )
+                    });
+                });
+            }
 
             if resp.changed() {
                 self.refresh_suggest();
@@ -293,8 +310,7 @@ impl ConsoleUi {
             }
 
             if has_focus && tab {
-                // Tab = accept the currently selected suggestion.
-                // It does not cycle selection (Unreal-style: arrows navigate, Tab commits).
+                // Tab = accept selected suggestion
                 self.refresh_suggest();
                 if !self.suggest.items.is_empty() {
                     self.suggest_open = true;
@@ -307,7 +323,6 @@ impl ConsoleUi {
                     if !ins.is_empty() {
                         self.input = ins;
                         self.refresh_suggest();
-                        // Keep panel open so user can continue completing args.
                         self.suggest_open = true;
                         self.suggest_selected = 0;
                     }
@@ -337,7 +352,6 @@ impl ConsoleUi {
             }
 
             if has_focus && enter {
-                // Enter always executes current line. Autocomplete is on Tab.
                 let line = self.input.trim().to_string();
                 self.input.clear();
                 self.suggest_open = false;

@@ -1,7 +1,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::plugins::describe::is_asset_importer;
-use crate::plugins::host_context::ctx;
+use crate::plugins::host_context::{ctx, ServiceEntry};
 use crate::plugins::importer::try_auto_register_importer;
 use abi_stable::std_types::{RResult, RString};
 use newengine_plugin_api::{
@@ -50,6 +50,7 @@ pub(crate) fn host_register_service_impl(
 ) -> RResult<(), RString> {
     let service_id = svc.id().to_string();
     let describe_json = svc.describe().to_string();
+    let owner = crate::plugins::host_context::current_plugin_id();
 
     let c = ctx();
 
@@ -66,7 +67,14 @@ pub(crate) fn host_register_service_impl(
             )));
         }
 
-        g.insert(service_id.clone(), Arc::from(svc));
+        g.insert(
+            service_id.clone(),
+            ServiceEntry {
+                owner_plugin_id: owner,
+                service: Arc::from(svc),
+                describe_json: describe_json.clone(),
+            },
+        );
         crate::plugins::host_context::bump_services_generation();
     }
 
@@ -110,7 +118,6 @@ pub(crate) extern "C" fn call_service_v1(
     let id = cap_id.to_string();
     let c = ctx();
 
-    // Clone the service under lock, then drop the lock before calling.
     let svc = {
         let g = match c.services.lock() {
             Ok(v) => v,
@@ -118,7 +125,7 @@ pub(crate) extern "C" fn call_service_v1(
         };
 
         match g.get(&id) {
-            Some(v) => v.clone(),
+            Some(v) => v.service.clone(),
             None => return RResult::RErr(RString::from(format!("service not found: {id}"))),
         }
     };

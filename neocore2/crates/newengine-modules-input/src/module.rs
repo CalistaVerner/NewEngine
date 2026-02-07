@@ -55,11 +55,47 @@ struct GamepadState {
 }
 
 #[derive(Default)]
+struct SnapshotCache {
+    epoch: u64,
+    json: String,
+}
+
+#[derive(Default)]
 struct State {
     keys: KeyState,
     mouse: MouseState,
     text: TextState,
     gamepads: BTreeMap<String, GamepadState>,
+
+    epoch: u64,
+    cache: SnapshotCache,
+}
+
+impl State {
+    #[inline]
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.cache.json.clear();
+    }
+
+    fn clear_transient_after_snapshot(&mut self) {
+        self.keys.pressed.clear();
+        self.keys.released.clear();
+
+        self.mouse.pressed.clear();
+        self.mouse.released.clear();
+        self.mouse.dx = 0.0;
+        self.mouse.dy = 0.0;
+        self.mouse.wheel_x = 0.0;
+        self.mouse.wheel_y = 0.0;
+
+        // Keep text buffers until taken:
+        // self.text.text -> text_take_json
+        // self.text.ime_commit -> ime_commit_take_json
+        //
+        // ime_preedit is stateful.
+    }
+
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -118,6 +154,8 @@ struct InputEventSink;
 impl EventSinkV1 for InputEventSink {
     fn on_event(&mut self, topic: RString, payload: Blob) {
         let topic = topic.as_str();
+
+        // IMPORTANT: keep the proven decode path (into_vec + from_str).
         let bytes: Vec<u8> = payload.into_vec();
 
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -130,11 +168,10 @@ impl EventSinkV1 for InputEventSink {
 
         match topic {
             "winit.key" => {
-                let Ok(ev) = serde_json::from_value::<KeyEventJson>(v) else {
-                    return;
-                };
+                let Ok(ev) = serde_json::from_value::<KeyEventJson>(v) else { return; };
 
                 let mut g = state().lock();
+
                 let was_down = g.keys.down.contains(&ev.key);
                 let is_down = ev.state.eq_ignore_ascii_case("pressed");
 
@@ -144,6 +181,7 @@ impl EventSinkV1 for InputEventSink {
                     g.keys.down.remove(&ev.key);
                 }
 
+                // Keep the original repeat semantics.
                 if !ev.repeat {
                     if is_down && !was_down {
                         g.keys.pressed.insert(ev.key);
@@ -152,41 +190,48 @@ impl EventSinkV1 for InputEventSink {
                         g.keys.released.insert(ev.key);
                     }
                 }
+
+                g.bump_epoch();
             }
 
             "winit.mouse_move" => {
-                let Ok(ev) = serde_json::from_value::<MouseMoveJson>(v) else {
-                    return;
-                };
+                let Ok(ev) = serde_json::from_value::<MouseMoveJson>(v) else { return; };
+
                 let mut g = state().lock();
-                g.mouse.x = ev.x;
-                g.mouse.y = ev.y;
+                if g.mouse.x != ev.x || g.mouse.y != ev.y {
+                    g.mouse.x = ev.x;
+                    g.mouse.y = ev.y;
+                    g.bump_epoch();
+                }
             }
 
             "winit.mouse_delta" => {
-                let Ok(ev) = serde_json::from_value::<MouseDeltaJson>(v) else {
-                    return;
-                };
-                let mut g = state().lock();
-                g.mouse.dx += ev.dx;
-                g.mouse.dy += ev.dy;
+                let Ok(ev) = serde_json::from_value::<MouseDeltaJson>(v) else { return; };
+
+                if ev.dx != 0.0 || ev.dy != 0.0 {
+                    let mut g = state().lock();
+                    g.mouse.dx += ev.dx;
+                    g.mouse.dy += ev.dy;
+                    g.bump_epoch();
+                }
             }
 
             "winit.mouse_wheel" => {
-                let Ok(ev) = serde_json::from_value::<MouseWheelJson>(v) else {
-                    return;
-                };
-                let mut g = state().lock();
-                g.mouse.wheel_x += ev.dx;
-                g.mouse.wheel_y += ev.dy;
+                let Ok(ev) = serde_json::from_value::<MouseWheelJson>(v) else { return; };
+
+                if ev.dx != 0.0 || ev.dy != 0.0 {
+                    let mut g = state().lock();
+                    g.mouse.wheel_x += ev.dx;
+                    g.mouse.wheel_y += ev.dy;
+                    g.bump_epoch();
+                }
             }
 
             "winit.mouse_button" => {
-                let Ok(ev) = serde_json::from_value::<MouseButtonJson>(v) else {
-                    return;
-                };
+                let Ok(ev) = serde_json::from_value::<MouseButtonJson>(v) else { return; };
 
                 let mut g = state().lock();
+
                 let was_down = g.mouse.down.contains(&ev.button);
                 let is_down = ev.state.eq_ignore_ascii_case("pressed");
 
@@ -202,6 +247,8 @@ impl EventSinkV1 for InputEventSink {
                 if !is_down && was_down {
                     g.mouse.released.insert(ev.button);
                 }
+
+                g.bump_epoch();
             }
 
             "winit.text_char" => {
@@ -209,6 +256,7 @@ impl EventSinkV1 for InputEventSink {
                     if let Some(ch) = char::from_u32(cp as u32) {
                         let mut g = state().lock();
                         g.text.text.push(ch);
+                        g.bump_epoch();
                     }
                 }
             }
@@ -216,8 +264,11 @@ impl EventSinkV1 for InputEventSink {
             "winit.ime_preedit" => {
                 if let Some(s) = v.get("text").and_then(|x| x.as_str()) {
                     let mut g = state().lock();
-                    g.text.ime_preedit.clear();
-                    g.text.ime_preedit.push_str(s);
+                    if g.text.ime_preedit != s {
+                        g.text.ime_preedit.clear();
+                        g.text.ime_preedit.push_str(s);
+                        g.bump_epoch();
+                    }
                 }
             }
 
@@ -226,6 +277,7 @@ impl EventSinkV1 for InputEventSink {
                     let mut g = state().lock();
                     g.text.ime_commit.clear();
                     g.text.ime_commit.push_str(s);
+                    g.bump_epoch();
                 }
             }
 
@@ -244,7 +296,13 @@ struct InputService;
 
 impl InputService {
     fn snapshot_json() -> String {
-        let g = state().lock();
+        let mut g = state().lock();
+
+        // Edge-safe: multiple calls within same epoch return identical snapshot
+        // (pressed/released/deltas/text are not lost).
+        if g.cache.epoch == g.epoch && !g.cache.json.is_empty() {
+            return g.cache.json.clone();
+        }
 
         let keys_down: Vec<u32> = g.keys.down.iter().copied().collect();
         let keys_pressed: Vec<u32> = g.keys.pressed.iter().copied().collect();
@@ -269,11 +327,12 @@ impl InputService {
             })
             .collect::<BTreeMap<_, _>>();
 
-        json!({
+        // EXACT schema as your "worked" version.
+        let out = json!({
             "keys": {
                 "down": keys_down,
                 "pressed": keys_pressed,
-                "released": keys_released,
+                "released": keys_released
             },
             "mouse": {
                 "pos": { "x": g.mouse.x, "y": g.mouse.y },
@@ -281,27 +340,41 @@ impl InputService {
                 "wheel": { "x": g.mouse.wheel_x, "y": g.mouse.wheel_y },
                 "down": mouse_down,
                 "pressed": mouse_pressed,
-                "released": mouse_released,
+                "released": mouse_released
             },
             "text": {
                 "buffer": g.text.text,
                 "ime_preedit": g.text.ime_preedit,
-                "ime_commit": g.text.ime_commit,
+                "ime_commit": g.text.ime_commit
             },
             "gamepads": pads
         })
-            .to_string()
+            .to_string();
+
+        g.cache.epoch = g.epoch;
+        g.cache.json = out.clone();
+
+        // Consume transient edge buffers after caching
+        g.clear_transient_after_snapshot();
+
+        out
     }
 
     fn take_text_json() -> String {
         let mut g = state().lock();
         let text = std::mem::take(&mut g.text.text);
+        if !text.is_empty() {
+            g.bump_epoch();
+        }
         json!({ "text": text }).to_string()
     }
 
     fn take_ime_commit_json() -> String {
         let mut g = state().lock();
         let text = std::mem::take(&mut g.text.ime_commit);
+        if !text.is_empty() {
+            g.bump_epoch();
+        }
         json!({ "ime_commit": text }).to_string()
     }
 }
@@ -316,7 +389,7 @@ impl ServiceV1 for InputService {
             r#"{
   "id":"kalitech.input.v1",
   "methods":{
-    "state_json":{"in":"{}","out":"input state snapshot as JSON"},
+    "state_json":{"in":"{}","out":"input state snapshot as JSON (edge-safe cached per epoch)"},
     "text_take_json":{"in":"{}","out":"{text:string} and clears internal text buffer"},
     "ime_commit_take_json":{"in":"{}","out":"{ime_commit:string} and clears internal commit buffer"}
   },
@@ -362,7 +435,6 @@ impl ServiceV1 for InputService {
         )
     }
 
-
     fn call(&self, method: MethodName, _payload: Blob) -> RResult<Blob, RString> {
         match method.as_str() {
             "state_json" => RResult::ROk(RVec::from(InputService::snapshot_json().into_bytes())),
@@ -383,7 +455,6 @@ impl ServiceV1 for InputService {
    ============================================================================================= */
 
 pub struct InputPlugin {
-    // FIX: Gilrs is not Sync; keep it behind a Mutex so InputPlugin becomes Sync.
     gilrs: Mutex<Option<Gilrs>>,
 }
 
@@ -431,25 +502,9 @@ impl InputPlugin {
 
                 _ => {}
             }
+
+            g.bump_epoch();
         }
-    }
-
-    fn end_frame(&self) {
-        let mut g = state().lock();
-
-        g.keys.pressed.clear();
-        g.keys.released.clear();
-
-        g.mouse.pressed.clear();
-        g.mouse.released.clear();
-
-        g.mouse.dx = 0.0;
-        g.mouse.dy = 0.0;
-        g.mouse.wheel_x = 0.0;
-        g.mouse.wheel_y = 0.0;
-
-        // Keep commit until taken; preedit is frame-local.
-        g.text.ime_preedit.clear();
     }
 }
 
@@ -493,7 +548,6 @@ impl PluginModule for InputPlugin {
 
     fn update(&mut self, _dt: f32) -> RResult<(), RString> {
         self.poll_gilrs();
-        self.end_frame();
         RResult::ROk(())
     }
 

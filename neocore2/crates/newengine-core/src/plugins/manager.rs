@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::plugins::host_api::{
     host_register_service_impl, with_importer_load_state, ImporterLoadState,
 };
+use crate::plugins::host_context::{unregister_by_owner, with_current_plugin_id};
 use crate::plugins::paths::{default_plugins_dir, is_dynamic_lib, resolve_plugins_dir};
 
 #[derive(Debug)]
@@ -28,6 +29,8 @@ struct LoadedPlugin {
     _lib: Library,
     module: PluginModuleDyn<'static>,
     info: PluginInfo,
+    enabled: bool,
+    disabled_reason: Option<String>,
 }
 
 pub struct PluginManager {
@@ -133,7 +136,6 @@ impl PluginManager {
         let dir = resolve_plugins_dir(dir)?;
         log::info!("plugins: scanning directory '{}'", dir.display());
 
-        // Keep behavior symmetric with importer loading: create directory if missing.
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return Err(PluginLoadError {
                 path: dir.clone(),
@@ -180,48 +182,103 @@ impl PluginManager {
         Ok(())
     }
 
+    #[inline]
+    fn rresult_to_string(r: abi_stable::std_types::RResult<(), abi_stable::std_types::RString>) -> Result<(), String> {
+        r.into_result().map_err(|e| e.to_string())
+    }
+
+
     pub fn start_all(&mut self) -> Result<(), String> {
-        for p in self.loaded.iter_mut() {
-            if let Err(e) = p.module.start().into_result() {
-                return Err(format!("plugin '{}' start failed: {}", p.info.id, e));
-            }
+        for i in 0..self.loaded.len() {
+            self.call_plugin(i, "start", |m| Self::rresult_to_string(m.start()));
         }
         Ok(())
     }
 
     pub fn fixed_update_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.loaded.iter_mut() {
-            if let Err(e) = p.module.fixed_update(dt).into_result() {
-                return Err(format!("plugin '{}' fixed_update failed: {}", p.info.id, e));
-            }
+        for i in 0..self.loaded.len() {
+            self.call_plugin(i, "fixed_update", |m| Self::rresult_to_string(m.fixed_update(dt)));
         }
         Ok(())
     }
 
     pub fn update_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.loaded.iter_mut() {
-            if let Err(e) = p.module.update(dt).into_result() {
-                return Err(format!("plugin '{}' update failed: {}", p.info.id, e));
-            }
+        for i in 0..self.loaded.len() {
+            self.call_plugin(i, "update", |m| Self::rresult_to_string(m.update(dt)));
         }
         Ok(())
     }
 
     pub fn render_all(&mut self, dt: f32) -> Result<(), String> {
-        for p in self.loaded.iter_mut() {
-            if let Err(e) = p.module.render(dt).into_result() {
-                return Err(format!("plugin '{}' render failed: {}", p.info.id, e));
-            }
+        for i in 0..self.loaded.len() {
+            self.call_plugin(i, "render", |m| Self::rresult_to_string(m.render(dt)));
         }
         Ok(())
     }
 
+
     pub fn shutdown(&mut self) {
-        for p in self.loaded.iter_mut().rev() {
-            p.module.shutdown();
+        for i in (0..self.loaded.len()).rev() {
+            let id = self.loaded[i].info.id.to_string();
+            self.safe_shutdown_one(i);
+            unregister_by_owner(&id);
         }
         self.loaded.clear();
         self.loaded_ids.clear();
+    }
+
+    fn call_plugin(
+        &mut self,
+        idx: usize,
+        op: &str,
+        f: impl FnOnce(&mut PluginModuleDyn<'static>) -> Result<(), String>,
+    ) {
+        if idx >= self.loaded.len() || !self.loaded[idx].enabled {
+            return;
+        }
+
+        let id = self.loaded[idx].info.id.to_string();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_plugin_id(&id, || f(&mut self.loaded[idx].module))
+        }));
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::error!("plugins: op '{}' failed for id='{}': {}", op, id, e);
+                self.disable_plugin(idx, &id, format!("op '{op}' failed: {e}"));
+            }
+            Err(_) => {
+                log::error!("plugins: panic during op '{}' for id='{}' (plugin disabled)", op, id);
+                self.disable_plugin(idx, &id, format!("panic during op '{op}'"));
+            }
+        }
+    }
+
+    fn disable_plugin(&mut self, idx: usize, id: &str, reason: String) {
+        if idx >= self.loaded.len() || !self.loaded[idx].enabled {
+            return;
+        }
+
+        self.loaded[idx].enabled = false;
+        self.loaded[idx].disabled_reason = Some(reason);
+
+        self.safe_shutdown_one(idx);
+        unregister_by_owner(id);
+    }
+
+    fn safe_shutdown_one(&mut self, idx: usize) {
+        if idx >= self.loaded.len() {
+            return;
+        }
+
+        let id = self.loaded[idx].info.id.to_string();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_plugin_id(&id, || {
+                self.loaded[idx].module.shutdown();
+            })
+        }));
     }
 
     fn load_one(&mut self, path: &Path, host: HostApiV1) -> Result<(), PluginLoadError> {
@@ -244,36 +301,58 @@ impl PluginManager {
         let info = module.info();
         let id_str = info.id.to_string();
 
-        // Prevent accidental double-load of the same plugin id (can cause duplicated services).
         if self.loaded_ids.contains(&id_str) {
             log::warn!(
-            "plugins: duplicate id='{}' from '{}' ignored (already loaded)",
-            id_str,
-            path.display()
-        );
-            module.shutdown();
+                "plugins: duplicate id='{}' from '{}' ignored (already loaded)",
+                id_str,
+                path.display()
+            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.shutdown()));
             return Ok(());
         }
 
-        if let Err(e) = module.init(host).into_result() {
-            return Err(PluginLoadError {
-                path: path.to_path_buf(),
-                message: format!("init failed: {e}"),
-            });
+        let init_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_plugin_id(&id_str, || module.init(host).into_result())
+        }));
+
+        match init_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                unregister_by_owner(&id_str);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_current_plugin_id(&id_str, || module.shutdown());
+                }));
+                return Err(PluginLoadError {
+                    path: path.to_path_buf(),
+                    message: format!("init failed: {e}"),
+                });
+            }
+            Err(_) => {
+                unregister_by_owner(&id_str);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_current_plugin_id(&id_str, || module.shutdown());
+                }));
+                return Err(PluginLoadError {
+                    path: path.to_path_buf(),
+                    message: "init panicked".to_string(),
+                });
+            }
         }
 
         log::info!(
-        "plugins: loaded id='{}' ver='{}' from '{}'",
-        info.id,
-        info.version,
-        path.display()
-    );
+            "plugins: loaded id='{}' ver='{}' from '{}'",
+            info.id,
+            info.version,
+            path.display()
+        );
 
         self.loaded_ids.insert(id_str);
         self.loaded.push(LoadedPlugin {
             _lib: lib,
             module,
             info,
+            enabled: true,
+            disabled_reason: None,
         });
 
         Ok(())
@@ -300,14 +379,31 @@ impl PluginManager {
         let root = unsafe { sym() };
         let mut module = root.create()();
 
+        let info_pre = module.info();
+        let id_pre = info_pre.id.to_string();
+
         let mut state = ImporterLoadState {
             saw_importer: false,
             staged: Vec::<ServiceV1Dyn<'static>>::new(),
         };
 
-        let init_result = with_importer_load_state(&mut state, || module.init(host).into_result());
+        let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_plugin_id(&id_pre, || {
+                with_importer_load_state(&mut state, || module.init(host).into_result())
+            })
+        }));
 
-        if let Err(e) = init_result {
+        let init_outcome: Result<(), String> = match init_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("init panicked".to_string()),
+        };
+
+        if let Err(e) = init_outcome {
+            unregister_by_owner(&id_pre);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_current_plugin_id(&id_pre, || module.shutdown());
+            }));
             return Err(PluginLoadError {
                 path: path.to_path_buf(),
                 message: format!("init failed: {e}"),
@@ -315,26 +411,48 @@ impl PluginManager {
         }
 
         if !state.saw_importer {
-            module.shutdown();
+            unregister_by_owner(&id_pre);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_current_plugin_id(&id_pre, || module.shutdown());
+            }));
             drop(module);
             drop(lib);
             return Ok(ImporterLoadOutcome::SkippedNotImporter);
         }
 
         for svc in state.staged.drain(..) {
-            if let Err(e) = host_register_service_impl(svc, true).into_result() {
-                module.shutdown();
-                return Err(PluginLoadError {
-                    path: path.to_path_buf(),
-                    message: format!("register_service_v1 failed: {e}"),
-                });
+            let reg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_current_plugin_id(&id_pre, || host_register_service_impl(svc, true).into_result())
+            }));
+
+            match reg {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    unregister_by_owner(&id_pre);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        with_current_plugin_id(&id_pre, || module.shutdown());
+                    }));
+                    return Err(PluginLoadError {
+                        path: path.to_path_buf(),
+                        message: format!("register_service_v1 failed: {e}"),
+                    });
+                }
+                Err(_) => {
+                    unregister_by_owner(&id_pre);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        with_current_plugin_id(&id_pre, || module.shutdown());
+                    }));
+                    return Err(PluginLoadError {
+                        path: path.to_path_buf(),
+                        message: "register_service_v1 panicked".to_string(),
+                    });
+                }
             }
         }
 
         let info = module.info();
-
-        // Importers are regular plugins too, but are loaded in a separate phase. Prevent duplicates.
         let id_str = info.id.to_string();
+
         if self.loaded_ids.contains(&id_str) {
             log::warn!(
                 target: "assets",
@@ -342,7 +460,10 @@ impl PluginManager {
                 id_str,
                 path.display()
             );
-            module.shutdown();
+            unregister_by_owner(&id_str);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_current_plugin_id(&id_str, || module.shutdown());
+            }));
             return Ok(ImporterLoadOutcome::SkippedNotImporter);
         }
 
@@ -352,6 +473,8 @@ impl PluginManager {
             _lib: lib,
             module,
             info: info.clone(),
+            enabled: true,
+            disabled_reason: None,
         });
 
         Ok(ImporterLoadOutcome::Loaded(info))
