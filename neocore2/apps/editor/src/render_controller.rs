@@ -193,23 +193,28 @@ impl EditorRenderController {
     }
 
     #[inline]
+    #[inline]
     fn mat4_perspective(fov_y_rad: f32, aspect: f32, z_near: f32, z_far: f32) -> [f32; 16] {
         let f = 1.0 / (0.5 * fov_y_rad).tan();
         let nf = 1.0 / (z_near - z_far);
 
-        // Column-major, Vulkan clip space Z: [0..1]
-        // Row-major form:
-        // [ f/aspect, 0,   0,              0 ]
-        // [ 0,       -f,  0,              0 ]
-        // [ 0,        0,  z_far*nf,       -1 ]
-        // [ 0,        0,  z_far*z_near*nf, 0 ]
+        // Column-major, RH, Vulkan clip Z: [0..1], with Y flipped (negative).
+        // Matrix (row form):
+        // [ f/aspect, 0,   0,                     0 ]
+        // [ 0,       -f,   0,                     0 ]
+        // [ 0,        0,  z_far*nf,  z_far*z_near*nf ]
+        // [ 0,        0,  -1,                    0 ]
+        //
+        // Column-major memory layout:
+        // [ m00 m10 m20 m30 | m01 m11 m21 m31 | m02 m12 m22 m32 | m03 m13 m23 m33 ]
         [
             f / aspect, 0.0, 0.0, 0.0, //
             0.0, -f, 0.0, 0.0,        //
-            0.0, 0.0, z_far * nf, z_far * z_near * nf, //
-            0.0, 0.0, -1.0, 0.0,      //
+            0.0, 0.0, z_far * nf, -1.0, //
+            0.0, 0.0, z_far * z_near * nf, 0.0, //
         ]
     }
+
 
     #[inline]
     fn vec3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -239,6 +244,17 @@ impl EditorRenderController {
         let inv = 1.0 / l2.sqrt();
         [v[0] * inv, v[1] * inv, v[2] * inv]
     }
+
+    #[inline]
+    fn mat4_scale_uniform(s: f32) -> [f32; 16] {
+        [
+            s, 0.0, 0.0, 0.0,
+            0.0, s, 0.0, 0.0,
+            0.0, 0.0, s, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]
+    }
+
 
     #[inline]
     fn mat4_look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> [f32; 16] {
@@ -394,13 +410,6 @@ void main() {
         let model = Model3dReader::from_blob_parts(blob.meta_json.as_ref(), &blob.payload)
             .map_err(|e| EngineError::other(format!("model: decode failed: {e}")))?;
 
-        if model.format != Model3dFormat::Ne3d {
-            log::warn!(
-                "model: '{MODEL_PATH}' imported as {:?} (need NE3D for rendering)",
-                model.format
-            );
-            return Ok(());
-        }
 
         let (pos, nrm, idx) = Self::decode_ne3d_mesh(&model.payload)?;
         if pos.is_empty() || idx.is_empty() {
