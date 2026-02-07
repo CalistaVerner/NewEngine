@@ -1,4 +1,3 @@
-// src/vulkan/resources.rs
 #![allow(dead_code)]
 
 use crate::error::VkResult;
@@ -14,7 +13,7 @@ pub struct BufferAlloc {
 
 impl BufferAlloc {
     #[inline]
-    pub const fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         self.buffer == vk::Buffer::null()
     }
 
@@ -43,7 +42,7 @@ pub struct ImageAlloc {
 
 impl ImageAlloc {
     #[inline]
-    pub const fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         self.image == vk::Image::null()
     }
 
@@ -78,7 +77,7 @@ pub struct DescriptorAlloc {
 
 impl DescriptorAlloc {
     #[inline]
-    pub const fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         self.layout == vk::DescriptorSetLayout::null()
     }
 
@@ -107,7 +106,7 @@ pub struct UploadCtx {
 
 impl UploadCtx {
     #[inline]
-    pub const fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.pool != vk::CommandPool::null()
             && self.cmd != vk::CommandBuffer::null()
             && self.fence != vk::Fence::null()
