@@ -1,6 +1,6 @@
 mod device;
 mod instance;
-mod pipeline;
+pub(crate) mod pipeline;
 mod resources;
 mod swapchain;
 mod text;
