@@ -71,4 +71,50 @@ impl CameraRig {
     pub fn translate_world(&mut self, delta_world: Vec3) {
         self.position += delta_world;
     }
+
+
+    /// Sets the rig transform from a look-at target.
+    ///
+    /// Convention: camera forward is -Z.
+    #[inline]
+    pub fn set_look_at(&mut self, position: Vec3, target: Vec3, up: Vec3) {
+        self.position = position;
+        self.rotation = look_at_rotation(position, target, up);
+    }
+
+    /// Creates a rig from a look-at target.
+    ///
+    /// Convention: camera forward is -Z.
+    #[inline]
+    pub fn from_look_at(position: Vec3, target: Vec3, up: Vec3) -> Self {
+        Self {
+            position,
+            rotation: look_at_rotation(position, target, up),
+        }
+    }
+}
+
+#[inline]
+fn look_at_rotation(position: Vec3, target: Vec3, up: Vec3) -> Quat {
+    let f = (target - position).normalize_or_zero();
+    if f.length_squared() < 1e-8 {
+        return Quat::IDENTITY;
+    }
+
+    // We want the camera -Z axis to point towards `f`.
+    let z_axis = (-f).normalize();
+    let mut x_axis = up.cross(z_axis);
+    if x_axis.length_squared() < 1e-8 {
+        // Fallback if up is parallel to forward.
+        x_axis = Vec3::Y.cross(z_axis);
+        if x_axis.length_squared() < 1e-8 {
+            x_axis = Vec3::X.cross(z_axis);
+        }
+    }
+    x_axis = x_axis.normalize();
+    let y_axis = z_axis.cross(x_axis).normalize();
+
+    // Column-major 3x3 basis in world space.
+    let m = glam::Mat3::from_cols(x_axis, y_axis, z_axis);
+    Quat::from_mat3(&m)
 }

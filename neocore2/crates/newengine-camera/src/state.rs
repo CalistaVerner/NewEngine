@@ -25,8 +25,8 @@ impl Default for CameraState {
             projection: Projection::Perspective(crate::Perspective::new(
                 60.0_f32.to_radians(),
                 16.0 / 9.0,
-                0.05,
-                2000.0,
+                0.1,
+                200.0,
             )),
             controller: FreeFlyController::default(),
             jitter: Vec2::ZERO,

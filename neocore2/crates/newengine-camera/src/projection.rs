@@ -5,9 +5,12 @@ use glam::Mat4;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Projection model for the camera.
+/// Camera projection.
 ///
-/// Important: `set_viewport()` must be called on resize to update aspect ratio.
+/// Engine baseline:
+/// - Right-handed.
+/// - Vulkan clip Z: 0..1.
+/// - Y flip baked into the matrix.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Projection {
@@ -35,11 +38,12 @@ impl Projection {
         }
     }
 
+    /// Vulkan-ready projection matrix.
     #[inline]
     pub fn matrix(&self) -> Mat4 {
         match self {
-            Self::Perspective(p) => p.matrix(),
-            Self::Orthographic(o) => o.matrix(),
+            Self::Perspective(p) => p.matrix_vk(),
+            Self::Orthographic(o) => o.matrix_vk(),
         }
     }
 }
@@ -65,8 +69,26 @@ impl Perspective {
         }
     }
 
+    /// RH perspective, Vulkan Z: 0..1, Y flipped.
     #[inline]
-    pub fn matrix(&self) -> Mat4 {
+    pub fn matrix_vk(&self) -> Mat4 {
+        let f = 1.0 / (0.5 * self.fovy).tan();
+        let aspect = self.aspect.max(1e-6);
+        let near = self.near.max(1e-6);
+        let far = self.far.max(near + 1e-3);
+        let nf = 1.0 / (near - far);
+
+        Mat4::from_cols_array(&[
+            f / aspect, 0.0, 0.0, 0.0,
+            0.0, -f, 0.0, 0.0,
+            0.0, 0.0, far * nf, -1.0,
+            0.0, 0.0, far * near * nf, 0.0,
+        ])
+    }
+
+    /// GL-style RH perspective, Z: -1..1, no Y flip.
+    #[inline]
+    pub fn matrix_gl(&self) -> Mat4 {
         Mat4::perspective_rh(self.fovy, self.aspect, self.near, self.far)
     }
 }
@@ -74,7 +96,7 @@ impl Perspective {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Orthographic {
-    /// Half-height in world units. Width is derived from aspect.
+    /// Half-height in world units.
     pub half_height: f32,
     pub aspect: f32,
     pub near: f32,
@@ -92,8 +114,30 @@ impl Orthographic {
         }
     }
 
+    /// RH orthographic, Vulkan Z: 0..1, Y flipped.
     #[inline]
-    pub fn matrix(&self) -> Mat4 {
+    pub fn matrix_vk(&self) -> Mat4 {
+        let hh = self.half_height.max(1e-6);
+        let hw = hh * self.aspect.max(1e-6);
+        let near = self.near.max(1e-6);
+        let far = self.far.max(near + 1e-3);
+
+        let m00 = 1.0 / hw;
+        let m11 = -1.0 / hh;
+        let m22 = 1.0 / (near - far);
+        let m32 = near / (near - far);
+
+        Mat4::from_cols_array(&[
+            m00, 0.0, 0.0, 0.0,
+            0.0, m11, 0.0, 0.0,
+            0.0, 0.0, m22, 0.0,
+            0.0, 0.0, m32, 1.0,
+        ])
+    }
+
+    /// GL-style RH orthographic, Z: -1..1, no Y flip.
+    #[inline]
+    pub fn matrix_gl(&self) -> Mat4 {
         let hh = self.half_height;
         let hw = hh * self.aspect;
         Mat4::orthographic_rh(-hw, hw, -hh, hh, self.near, self.far)
