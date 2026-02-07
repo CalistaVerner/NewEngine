@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::types::{FrameSync, FRAMES_IN_FLIGHT};
+use crate::vulkan::resources::{DeferredFree, UploadCtx};
 use crate::vulkan::ui::GpuUiTexture;
+
+pub(crate) const UPLOAD_CONTEXTS: usize = 3;
 
 pub struct CoreContext {
     pub(crate) instance: ash::Instance,
@@ -50,7 +53,14 @@ pub struct FrameManager {
     pub(crate) images_in_flight: Vec<vk::Fence>,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) command_buffers: Vec<vk::CommandBuffer>,
+
+    // Legacy pool kept for compatibility with older call sites.
+    // New code should use `upload_ctxs`.
     pub(crate) upload_command_pool: vk::CommandPool,
+
+    pub(crate) upload_ctxs: [UploadCtx; UPLOAD_CONTEXTS],
+    pub(crate) upload_cursor: usize,
+    pub(crate) deferred_free: DeferredFree,
 }
 
 pub struct TextOverlayResources {

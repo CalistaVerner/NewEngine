@@ -8,6 +8,11 @@ use super::types::FRAMES_IN_FLIGHT;
 
 impl VulkanRenderer {
     pub fn begin_frame(&mut self, clear_rgba: [f32; 4]) -> VkResult<()> {
+        // Release any upload staging resources whose fences are signaled.
+        unsafe {
+            self.frames.deferred_free.pump(&self.core.device)?;
+        }
+
         if self.debug.in_frame {
             return Err(VkRenderError::InvalidState("begin_frame called while already in frame"));
         }
@@ -105,10 +110,11 @@ impl VulkanRenderer {
                 x: 0.0,
                 y: 0.0,
                 width: self.swapchain.extent.width as f32,
-                height: self.swapchain.extent.height as f32,
+                height: self.swapchain.extent.height as f32, // <- positive
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
+
             let scissor = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: self.swapchain.extent,

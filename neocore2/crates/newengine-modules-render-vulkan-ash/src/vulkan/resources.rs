@@ -129,13 +129,35 @@ impl UploadCtx {
     }
 
     #[inline]
-    pub unsafe fn submit<F: FnOnce(vk::CommandBuffer)>(
+    pub unsafe fn is_in_flight(&self, device: &ash::Device) -> VkResult<bool> {
+        debug_assert!(self.is_ready());
+        match device.get_fence_status(self.fence) {
+            Ok(_) => Ok(false),
+            Err(vk::Result::NOT_READY) => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Records and submits an upload command buffer.
+    ///
+    /// Contract:
+    /// - This method does NOT block.
+    /// - The caller must ensure that the context is not in flight (or accept a wait).
+    ///
+    /// Returns the fence associated with this submission.
+    #[inline]
+    pub unsafe fn submit_async<F: FnOnce(vk::CommandBuffer)>(
         &self,
         device: &ash::Device,
         queue: vk::Queue,
         f: F,
-    ) -> VkResult<()> {
+    ) -> VkResult<vk::Fence> {
         debug_assert!(self.is_ready());
+
+        // If the context is still in flight, we must wait; otherwise we'd reset in-use resources.
+        if self.is_in_flight(device)? {
+            device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
 
         device.reset_fences(&[self.fence])?;
         device.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
@@ -152,8 +174,159 @@ impl UploadCtx {
 
         let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd));
         device.queue_submit(queue, std::slice::from_ref(&submit), self.fence)?;
-        device.wait_for_fences(&[self.fence], true, u64::MAX)?;
 
+        Ok(self.fence)
+    }
+}
+
+/// Deferred destruction queue keyed by a fence.
+///
+/// This is the minimal "game-ready" primitive for upload staging cleanup.
+/// Anything pushed here MUST remain valid until the corresponding fence is signaled.
+pub struct DeferredFree {
+    items: Vec<DeferredItem>,
+}
+
+impl DeferredFree {
+    #[inline]
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[inline]
+    pub fn push_buffer(&mut self, fence: vk::Fence, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+        if buffer == vk::Buffer::null() && memory == vk::DeviceMemory::null() {
+            return;
+        }
+        self.items.push(DeferredItem::Buffer { fence, buffer, memory });
+    }
+
+    #[inline]
+    pub fn push_descriptor_pool(&mut self, fence: vk::Fence, pool: vk::DescriptorPool) {
+        if pool == vk::DescriptorPool::null() {
+            return;
+        }
+        self.items.push(DeferredItem::DescriptorPool { fence, pool });
+    }
+
+    #[inline]
+    pub fn push_image(
+        &mut self,
+        fence: vk::Fence,
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+        sampler: vk::Sampler,
+    ) {
+        if image == vk::Image::null()
+            && view == vk::ImageView::null()
+            && memory == vk::DeviceMemory::null()
+            && sampler == vk::Sampler::null()
+        {
+            return;
+        }
+        self.items.push(DeferredItem::Image {
+            fence,
+            image,
+            view,
+            memory,
+            sampler,
+        });
+    }
+
+    /// Destroys everything whose fence is already signaled.
+    pub unsafe fn pump(&mut self, device: &ash::Device) -> VkResult<()> {
+        let mut i = 0usize;
+        while i < self.items.len() {
+            let fence = self.items[i].fence();
+            let signaled = match device.get_fence_status(fence) {
+                Ok(_) => true,
+                Err(vk::Result::NOT_READY) => false,
+                Err(e) => return Err(e.into()),
+            };
+
+            if !signaled {
+                i += 1;
+                continue;
+            }
+
+            let item = self.items.swap_remove(i);
+            item.destroy(device);
+        }
         Ok(())
+    }
+}
+
+enum DeferredItem {
+    Buffer {
+        fence: vk::Fence,
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    },
+    DescriptorPool {
+        fence: vk::Fence,
+        pool: vk::DescriptorPool,
+    },
+    Image {
+        fence: vk::Fence,
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+        sampler: vk::Sampler,
+    },
+}
+
+impl DeferredItem {
+    #[inline]
+    fn fence(&self) -> vk::Fence {
+        match *self {
+            DeferredItem::Buffer { fence, .. } => fence,
+            DeferredItem::DescriptorPool { fence, .. } => fence,
+            DeferredItem::Image { fence, .. } => fence,
+        }
+    }
+
+    #[inline]
+    unsafe fn destroy(self, device: &ash::Device) {
+        match self {
+            DeferredItem::Buffer { buffer, memory, .. } => {
+                if buffer != vk::Buffer::null() {
+                    device.destroy_buffer(buffer, None);
+                }
+                if memory != vk::DeviceMemory::null() {
+                    device.free_memory(memory, None);
+                }
+            }
+            DeferredItem::DescriptorPool { pool, .. } => {
+                if pool != vk::DescriptorPool::null() {
+                    device.destroy_descriptor_pool(pool, None);
+                }
+            }
+            DeferredItem::Image {
+                image,
+                view,
+                memory,
+                sampler,
+                ..
+            } => {
+                if sampler != vk::Sampler::null() {
+                    device.destroy_sampler(sampler, None);
+                }
+                if view != vk::ImageView::null() {
+                    device.destroy_image_view(view, None);
+                }
+                if image != vk::Image::null() {
+                    device.destroy_image(image, None);
+                }
+                if memory != vk::DeviceMemory::null() {
+                    device.free_memory(memory, None);
+                }
+            }
+        }
     }
 }

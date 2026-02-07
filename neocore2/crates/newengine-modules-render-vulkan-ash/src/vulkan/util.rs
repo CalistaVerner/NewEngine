@@ -100,7 +100,11 @@ pub unsafe fn transition_image(
 }
 
 /// One-shot submit utility for short copy/transition work.
-/// Uses queue_wait_idle for simplicity/stability.
+///
+/// Note:
+/// - This does NOT call `queue_wait_idle`.
+/// - It uses a temporary fence and waits for that fence.
+/// - Prefer `VulkanRenderer::submit_upload` for high-frequency uploads.
 pub unsafe fn immediate_submit<F: FnOnce(vk::CommandBuffer)>(
     device: &ash::Device,
     pool: vk::CommandPool,
@@ -123,9 +127,12 @@ pub unsafe fn immediate_submit<F: FnOnce(vk::CommandBuffer)>(
 
     device.end_command_buffer(cmd)?;
 
+    let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+
     let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-    device.queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())?;
-    device.queue_wait_idle(queue)?;
+    device.queue_submit(queue, std::slice::from_ref(&submit), fence)?;
+    device.wait_for_fences(&[fence], true, u64::MAX)?;
+    device.destroy_fence(fence, None);
 
     device.free_command_buffers(pool, std::slice::from_ref(&cmd));
     Ok(())

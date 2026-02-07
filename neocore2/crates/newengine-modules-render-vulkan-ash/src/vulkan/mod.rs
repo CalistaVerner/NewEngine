@@ -5,7 +5,7 @@ mod resources;
 mod swapchain;
 mod text;
 mod ui;
-mod util;
+pub(crate) mod util;
 
 pub mod renderer;
 

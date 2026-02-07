@@ -10,6 +10,13 @@ impl Drop for VulkanRenderer {
             self.destroy_ui_overlay();
             self.destroy_text_overlay();
 
+            // Flush deferred frees; device is idle already.
+            let _ = self.frames.deferred_free.pump(&self.core.device);
+
+            for ctx in &mut self.frames.upload_ctxs {
+                ctx.destroy(&self.core.device);
+            }
+
             if self.frames.upload_command_pool != vk::CommandPool::null() {
                 self.core
                     .device

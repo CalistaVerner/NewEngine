@@ -1,4 +1,5 @@
 use crate::vulkan::pipeline::create_shader_module;
+use crate::vulkan::util::immediate_submit;
 use crate::vulkan::VulkanRenderer;
 
 use ash::vk;
@@ -15,6 +16,8 @@ struct VkBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    host_visible: bool,
 }
 
 #[derive(Clone)]
@@ -235,7 +238,13 @@ impl VulkanRenderApi {
             .bind_buffer_memory(buffer, memory, 0)
             .map_err(|e| EngineError::other(e.to_string()))?;
 
-        Ok(VkBuffer { buffer, memory, size })
+        Ok(VkBuffer {
+            buffer,
+            memory,
+            size,
+            usage,
+            host_visible: props.contains(vk::MemoryPropertyFlags::HOST_VISIBLE),
+        })
     }
 
     unsafe fn current_cmd(&self) -> Option<vk::CommandBuffer> {
@@ -390,21 +399,111 @@ impl RenderApi for VulkanRenderApi {
     }
 
     fn write_buffer(&mut self, id: BufferId, offset: u64, data: &[u8]) -> EngineResult<()> {
-        let b = *self.buffers.get(&id).ok_or_else(|| EngineError::other("write_buffer: invalid BufferId"))?;
-        let device = &self.renderer.core.device;
+        let b = *self
+            .buffers
+            .get(&id)
+            .ok_or_else(|| EngineError::other("write_buffer: invalid BufferId"))?;
+
+        if (offset as u128) + (data.len() as u128) > (b.size as u128) {
+            return Err(EngineError::other("write_buffer: out of bounds"));
+        }
 
         unsafe {
+            let device = &self.renderer.core.device;
+
+            if b.host_visible {
+                let ptr = device
+                    .map_memory(
+                        b.memory,
+                        offset as vk::DeviceSize,
+                        data.len() as vk::DeviceSize,
+                        vk::MemoryMapFlags::empty(),
+                    )
+                    .map_err(|e| EngineError::other(e.to_string()))? as *mut u8;
+
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                device.unmap_memory(b.memory);
+                return Ok(());
+            }
+
+            let staging = self.create_vk_buffer(
+                data.len() as vk::DeviceSize,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+
             let ptr = device
                 .map_memory(
-                    b.memory,
-                    offset as vk::DeviceSize,
+                    staging.memory,
+                    0,
                     data.len() as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )
                 .map_err(|e| EngineError::other(e.to_string()))? as *mut u8;
 
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            device.unmap_memory(b.memory);
+            device.unmap_memory(staging.memory);
+
+            immediate_submit(
+                device,
+                self.renderer.frames.upload_command_pool,
+                self.renderer.core.queue,
+                |cmd| {
+                    let region = vk::BufferCopy::default()
+                        .src_offset(0)
+                        .dst_offset(offset as vk::DeviceSize)
+                        .size(data.len() as vk::DeviceSize);
+
+                    device.cmd_copy_buffer(cmd, staging.buffer, b.buffer, std::slice::from_ref(&region));
+
+                    let (dst_stage, dst_access) = if b.usage.intersects(
+                        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+                    ) {
+                        (
+                            vk::PipelineStageFlags::VERTEX_INPUT,
+                            vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::INDEX_READ,
+                        )
+                    } else if b.usage.contains(vk::BufferUsageFlags::UNIFORM_BUFFER) {
+                        (
+                            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::AccessFlags::UNIFORM_READ,
+                        )
+                    } else if b.usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER) {
+                        (
+                            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )
+                    } else {
+                        (
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        )
+                    };
+
+                    let barrier = vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(dst_access)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(b.buffer)
+                        .offset(offset as vk::DeviceSize)
+                        .size(data.len() as vk::DeviceSize);
+
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        dst_stage,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        std::slice::from_ref(&barrier),
+                        &[],
+                    );
+                },
+            )
+                .map_err(|e| EngineError::other(e.to_string()))?;
+
+            device.destroy_buffer(staging.buffer, None);
+            device.free_memory(staging.memory, None);
         }
 
         Ok(())
@@ -596,7 +695,6 @@ impl RenderApi for VulkanRenderApi {
         Ok(id)
     }
 
-
     fn destroy_bind_group_layout(&mut self, id: BindGroupLayoutId) {
         if let Some(l) = self.bg_layouts.remove(&id) {
             unsafe { self.renderer.core.device.destroy_descriptor_set_layout(l.layout, None); }
@@ -687,7 +785,6 @@ impl RenderApi for VulkanRenderApi {
 
             let mut pending: Vec<PendingBufWrite> = Vec::new();
 
-            // Если хочешь избежать реаллокаций и вообще любых шансов на движение памяти:
             buf_infos.reserve_exact((need_ubo + need_ssbo) as usize);
             pending.reserve_exact((need_ubo + need_ssbo) as usize);
 
@@ -746,7 +843,6 @@ impl RenderApi for VulkanRenderApi {
                 }
             }
 
-            // Второй проход: теперь buf_infos больше не меняется, можно безопасно ссылаться.
             writes.reserve_exact(pending.len());
             for p in pending {
                 let bi_ref = std::slice::from_ref(&buf_infos[p.buf_info_index]);
@@ -763,7 +859,6 @@ impl RenderApi for VulkanRenderApi {
                 device.update_descriptor_sets(&writes, &[]);
             }
 
-
             self.bind_groups.insert(
                 id,
                 VkBindGroup {
@@ -776,7 +871,6 @@ impl RenderApi for VulkanRenderApi {
 
         Ok(id)
     }
-
 
     fn destroy_bind_group(&mut self, id: BindGroupId) {
         if let Some(bg) = self.bind_groups.remove(&id) {

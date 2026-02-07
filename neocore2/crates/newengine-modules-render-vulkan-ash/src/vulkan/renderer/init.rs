@@ -6,11 +6,13 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::ffi::CString;
 use std::time::Instant;
 
+use super::state::UPLOAD_CONTEXTS;
 use super::state::{
     CoreContext, DebugState, FrameManager, PipelinePack, SwapchainContext, TextOverlayResources,
     UiOverlayResources, VulkanRenderer,
 };
 use super::types::{FrameSync, FRAMES_IN_FLIGHT};
+use crate::vulkan::resources::{DeferredFree, UploadCtx};
 
 use super::super::device::*;
 use super::super::instance::*;
@@ -115,6 +117,30 @@ impl VulkanRenderer {
             None,
         )?;
 
+        let mut upload_ctxs = [UploadCtx::default(); UPLOAD_CONTEXTS];
+        for ctx in &mut upload_ctxs {
+            let pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )?;
+
+            let cmd = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+
+            let fence = device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )?;
+
+            *ctx = UploadCtx { pool, cmd, fence };
+        }
+
         let make_frame = |device: &Device| -> VkResult<FrameSync> {
             let image_available =
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
@@ -213,7 +239,6 @@ impl VulkanRenderer {
             current_swapchain_idx: 0,
         };
 
-
         let mut me = Self {
             core,
             swapchain,
@@ -225,6 +250,10 @@ impl VulkanRenderer {
                 command_pool,
                 command_buffers,
                 upload_command_pool,
+
+                upload_ctxs,
+                upload_cursor: 0,
+                deferred_free: DeferredFree::new(),
             },
             text,
             ui,
